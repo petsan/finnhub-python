@@ -88,6 +88,7 @@ def recent_headlines(
             "headline": a.headline,
             "source": a.source,
             "symbol": a.symbol or "*",
+            "url": a.url or "",
             "sentiment": score_map.get(a.id, float("nan")),
         }
         for a in articles
@@ -139,6 +140,47 @@ def prediction_history(
             for p in preds
         ]
     )
+
+
+def _escape_markdown(text: str) -> str:
+    """Escape characters that would break a Markdown link's display text.
+
+    Headlines occasionally contain ``[``, ``]``, ``*``, or backticks. We
+    don't try to fully escape Markdown — just enough that a link like
+    ``[<text>](<url>)`` always renders the headline verbatim.
+    """
+    return (
+        text.replace("\\", "\\\\")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace("`", "\\`")
+    )
+
+
+def _format_headline_markdown(row: dict) -> str:
+    """One Markdown line per headline; clickable if the URL is present."""
+    headline = _escape_markdown(str(row.get("headline") or "").strip()) or "(no title)"
+    url = (row.get("url") or "").strip()
+    # Only link when the URL looks remotely usable. Anything else is plain text.
+    title_md = f"[{headline}]({url})" if url.startswith(("http://", "https://")) else f"**{headline}**"
+
+    bits = [title_md]
+    source = (row.get("source") or "").strip()
+    if source:
+        bits.append(f"*{_escape_markdown(source)}*")
+    symbol = (row.get("symbol") or "").strip()
+    if symbol and symbol != "*":
+        bits.append(f"`{symbol}`")
+    published = row.get("published_at")
+    if published is not None:
+        bits.append(published.strftime("%Y-%m-%d %H:%M UTC"))
+    sentiment = row.get("sentiment")
+    # NaN sentiment shows as "—"; otherwise show signed score.
+    if isinstance(sentiment, float) and sentiment == sentiment:  # NaN check
+        bits.append(f"sentiment {sentiment:+.2f}")
+    else:
+        bits.append("sentiment —")
+    return " · ".join(bits)
 
 
 def sector_grid(session: Session, sectors: Iterable[Sector]) -> pd.DataFrame:
@@ -340,9 +382,19 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                 cols[2].metric("Articles", pred.article_count)
 
             st.subheader("Recent headlines")
-            headlines = recent_headlines(session, limit=10)
+            # VaderScorer().model_version is the version that the ingestion
+            # job stamped onto every score row in iter 1.
+            from finn_predictor.sentiment.vader import VaderScorer  # local import keeps cold path cheap
+
+            headlines = recent_headlines(
+                session, limit=10, model_version=VaderScorer().model_version
+            )
             if headlines:
-                st.dataframe(pd.DataFrame(headlines), use_container_width=True)
+                for row in headlines:
+                    st.markdown(
+                        "- " + _format_headline_markdown(row),
+                        unsafe_allow_html=False,
+                    )
             else:
                 st.write("No headlines yet.")
 

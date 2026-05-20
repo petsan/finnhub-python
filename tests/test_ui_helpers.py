@@ -15,6 +15,8 @@ from finn_predictor.storage.repo import (
     upsert_articles,
 )
 from finn_predictor.ui.app import (
+    _escape_markdown,
+    _format_headline_markdown,
     _parse_symbols,
     latest_market_prediction,
     prediction_history,
@@ -65,6 +67,27 @@ def test_recent_headlines_returns_score_when_available(session) -> None:
     assert by_headline["hl-1"]["sentiment"] != by_headline["hl-1"]["sentiment"]  # NaN != NaN
 
 
+def test_recent_headlines_includes_url_field(session) -> None:
+    """The Today tab links each headline to its source URL."""
+    upsert_articles(
+        session,
+        [
+            make_article(
+                finnhub_id=1,
+                headline="With URL",
+                url="https://example.com/story",
+                published_at=D,
+            ),
+            # Article with no URL — UI should fall back gracefully.
+            make_article(finnhub_id=2, headline="No URL", url="", published_at=D),
+        ],
+    )
+    rows = recent_headlines(session)
+    by_headline = {r["headline"]: r for r in rows}
+    assert by_headline["With URL"]["url"] == "https://example.com/story"
+    assert by_headline["No URL"]["url"] == ""
+
+
 def test_recent_headlines_handles_no_articles(session) -> None:
     assert recent_headlines(session) == []
 
@@ -111,6 +134,89 @@ def test_sector_grid_one_row_per_sector(session) -> None:
     energy = df[df["etf"] == "XLE"].iloc[0]
     assert tech["label"] == "UP"
     assert energy["label"] == "—"
+
+
+# ---------------- headline markdown formatting ----------------
+
+
+def test_escape_markdown_handles_brackets_and_backticks() -> None:
+    assert _escape_markdown("a [b] c") == "a \\[b\\] c"
+    assert _escape_markdown("use `pip`") == "use \\`pip\\`"
+    assert _escape_markdown("back\\slash") == "back\\\\slash"
+
+
+def test_format_headline_markdown_with_http_url() -> None:
+    row = {
+        "headline": "Markets close higher",
+        "url": "https://example.com/a",
+        "source": "Reuters",
+        "symbol": "*",
+        "published_at": datetime(2026, 5, 19, 14, 30, tzinfo=timezone.utc),
+        "sentiment": 0.42,
+    }
+    line = _format_headline_markdown(row)
+    assert "[Markets close higher](https://example.com/a)" in line
+    assert "*Reuters*" in line
+    assert "2026-05-19 14:30 UTC" in line
+    assert "sentiment +0.42" in line
+
+
+def test_format_headline_markdown_falls_back_when_url_missing() -> None:
+    row = {
+        "headline": "Plain",
+        "url": "",
+        "source": "",
+        "symbol": "",
+        "published_at": None,
+        "sentiment": float("nan"),
+    }
+    line = _format_headline_markdown(row)
+    assert "(" not in line.split("**Plain**")[0]  # no malformed link
+    assert "**Plain**" in line  # bold fallback when no URL
+    assert "sentiment —" in line  # NaN renders as em-dash
+
+
+def test_format_headline_markdown_rejects_unsafe_url_schemes() -> None:
+    """Only http(s) URLs become clickable links — anything else is plain bold."""
+    row = {
+        "headline": "Suspicious",
+        "url": "javascript:alert(1)",
+        "source": "",
+        "symbol": "*",
+        "published_at": None,
+        "sentiment": float("nan"),
+    }
+    line = _format_headline_markdown(row)
+    assert "javascript:" not in line
+    assert "**Suspicious**" in line
+
+
+def test_format_headline_markdown_escapes_brackets_in_headline() -> None:
+    row = {
+        "headline": "Stocks [really] surge",
+        "url": "https://x.example/y",
+        "source": "",
+        "symbol": "*",
+        "published_at": None,
+        "sentiment": float("nan"),
+    }
+    line = _format_headline_markdown(row)
+    # Bracketed text must be escaped so the Markdown parser doesn't
+    # interpret it as an inline link.
+    assert "[Stocks \\[really\\] surge](https://x.example/y)" in line
+
+
+def test_format_headline_markdown_handles_empty_headline() -> None:
+    row = {
+        "headline": "",
+        "url": "https://x.example/y",
+        "source": "",
+        "symbol": "*",
+        "published_at": None,
+        "sentiment": float("nan"),
+    }
+    line = _format_headline_markdown(row)
+    assert "(no title)" in line
 
 
 # ---------------- sidebar-supplied API key plumbing ----------------
