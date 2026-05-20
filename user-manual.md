@@ -275,10 +275,13 @@ rows get an "Activate v\<n\>" button so you can revert at any time.
   modelled. Hit-rate and Cumulative PnL on the Performance tab are
   the upper bound of "what a frictionless system would have done";
   add any realistic spread/commission/slippage and the curve sags.
-* **Story clustering is a heuristic.** The "first reported" timestamp
-  is computed via an 8-word headline prefix match. Wires that
+* **Story clustering defaults to a heuristic.** The "first reported"
+  timestamp is computed via an 8-word headline prefix match. Wires that
   paraphrase heavily won't cluster; unrelated stories with the same
-  lead may cluster.
+  lead may cluster. For paraphrase-aware clustering, install
+  `sentence-transformers` and set `FINN_PREDICTOR_CLUSTERER=embedding`
+  — the column is then driven by cosine similarity on
+  `all-MiniLM-L6-v2` embeddings (~80 MB on first download).
 
 ---
 

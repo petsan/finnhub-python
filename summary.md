@@ -135,6 +135,7 @@ of up to a year.
 | Pluggable scorer | `FINN_PREDICTOR_SCORER=finbert` swaps VADER for FinBERT (requires `pip install torch transformers`); the live pipeline, backfill scoring, and the learning loop's `model_version` selector all route through one helper. |
 | Cap-weighted sectors | Per-sector aggregation multiplies each article's recency × source weight by its company's most-recent market cap (Finnhub `/stock/historical-market-cap`). Tickers without a cap row keep weight 1.0; sectors fall back to uniform when nothing has been ingested. |
 | Calibrated classifier | `FINN_PREDICTOR_CLASSIFIER=logreg` plus a fitted calibration replaces the z-score rule with `P(up) = sigmoid(intercept + beta * sentiment_index)`. Fit via `python -m finn_predictor.cli fit-classifier` once enough outcomes have closed; confidence becomes `|2P − 1|`. |
+| Pluggable story clustering | Default 8-word-prefix matcher catches identical-lead reposts; `FINN_PREDICTOR_CLUSTERER=embedding` switches to sentence-transformers cosine clustering (lazy-loaded, ~80 MB on first use, default model `all-MiniLM-L6-v2`). The embedding path catches paraphrased rewrites the prefix matcher misses. Falls back to prefix on embed failure. |
 | Postgres support | Set `FINN_PREDICTOR_DB_URL="postgresql+psycopg://..."` — the upserts are dialect-aware. `psycopg[binary]` ships in default requirements. |
 | Structured logging | `FINN_PREDICTOR_LOG_FORMAT=json` switches to one-record-per-line JSON output suitable for log aggregators. |
 | Docker | `docker compose up --build` builds and starts the app on host 8501. Named volume keeps the SQLite DB across `down`. `RESET_DB=1` wipes on next start. `docker compose run --rm app ingest|retrain|reset-db|shell|hash-password` for headless ops. Runs as non-root. |
@@ -169,7 +170,7 @@ Every external HTTP call goes through `FinnhubGateway` (Finnhub) or an
 injectable `history_fn` (yfinance), both mocked in tests — **no test
 makes a real network call**. SQLite-backed tests run against `:memory:`
 per-test, giving fast and isolated coverage. As of the latest commit:
-**381 tests passing at 96% line+branch coverage** across the
+**409 tests passing at 96% line+branch coverage** across the
 `finn_predictor` package.
 
 See `progress.md` for the design doc, `diff.md` for the per-commit

@@ -108,7 +108,8 @@ from finn_predictor.storage.models import (
     SentimentScore,
 )
 from finn_predictor.storage.repo import all_sectors, predictions_for
-from finn_predictor.storage.stories import earliest_story_times
+from finn_predictor.storage.clustering import resolve_active_clusterer
+from finn_predictor.storage.stories import earliest_story_times  # noqa: F401  (kept for tests / external imports)
 from finn_predictor.storage.symbol_names import expand_symbol, expand_symbol_short
 
 
@@ -371,7 +372,10 @@ def attach_first_seen(
     if not rows:
         return rows
     headlines = [r.get("headline", "") for r in rows]
-    earliest = earliest_story_times(session, headlines)
+    # Pluggable: prefix matcher by default; FINN_PREDICTOR_CLUSTERER=embedding
+    # switches to the sentence-transformers cosine clusterer.
+    clusterer = resolve_active_clusterer()
+    earliest = clusterer.earliest_times(session, headlines)
     for r in rows:
         r["first_seen_at"] = earliest.get(r.get("headline", ""))
     return rows
@@ -423,7 +427,7 @@ def contribution_chart_data(
     # tests that pass session=None still get a usable frame.
     first_seen_map: dict[str, datetime | None] = {}
     if session is not None:
-        first_seen_map = earliest_story_times(
+        first_seen_map = resolve_active_clusterer().earliest_times(
             session, [c.article.headline for c in ordered]
         )
 

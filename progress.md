@@ -292,7 +292,7 @@ python3 -m venv .venv
 - ~~Market-cap weighting for sector aggregates is wired through but not populated yet (no `historical_market_cap` ingestion). Weights default to uniform.~~ **Closed 2026-05-20**: `historical_market_cap` is now part of the daily ingest for every user-listed company ticker; `predict_sector` cap-weights articles when caps exist and silently falls back to uniform otherwise.
 - ~~FinBERT activation is gated on someone running `get_scorer("finbert")`.~~ **Closed 2026-05-20**: set `FINN_PREDICTOR_SCORER=finbert` to flip the live pipeline. VADER stays default; FinBERT requires `pip install torch transformers`. The training loop reads the matching `model_version` automatically.
 - ~~The threshold model is a rule, not a fitted classifier.~~ **Closed 2026-05-20**: `FINN_PREDICTOR_CLASSIFIER=logreg` switches the final decision to a fitted logistic regression of `P(up | sentiment_index)`. Fit with `python -m finn_predictor.cli fit-classifier`; confidence becomes `|2P − 1|` (calibrated probability gap). Defaults to `rule` so existing deploys are unaffected.
-- Story clustering is a heuristic — first-8-word headline prefix match. Wires that paraphrase heavily won't cluster; unrelated leads occasionally collide. An embedding-based clusterer is the natural next step.
+- ~~Story clustering is a heuristic — first-8-word headline prefix match.~~ **Closed 2026-05-20**: pluggable `Clusterer` protocol with `PrefixClusterer` (default, dependency-free 8-word-prefix matcher) and `EmbeddingClusterer` (sentence-transformers cosine, lazy-loaded). Flip via `FINN_PREDICTOR_CLUSTERER=embedding`; injectable `embed_fn` keeps tests hermetic. Failed embed calls fall back to the prefix matcher automatically.
 - No live trading. Predictions are purely informational and the UI is read-only.
 
 ---
@@ -328,6 +328,7 @@ python3 -m venv .venv
 - 2026-05-20 — Cap ingest fan-out across cached sector constituents: `run_daily_ingest` walks every `Sector`'s cached `RelatedEntity(ETF_HOLDING)` rows after the company-symbols loop and pulls `historical_market_cap` for each one, deduped against the user-listed tickers so we don't repeat work. New `constituent_caps` count + per-symbol failure isolation. Closes the last cap-weighting gap from the prior sprint — sectors built from constituents (no need to list them in `company_symbols`) now also pick up cap weighting.
 - 2026-05-20 — Scorer-mismatch warning at startup: new `detect_scorer_mismatch` / `warn_if_scorer_mismatch` helpers in the sentiment package. Compare the live scorer's `model_version` against the most-recent `Prediction.model_version`; on drift, log a WARNING explaining that the rolling baseline is stale and pointing at the `retrain` CLI. Hooked into both the CLI `ingest` path and the UI's `run_ingestion_with_key`. Silent on a matching DB or an empty DB.
 - 2026-05-20 — UI smoke tests via `streamlit.testing.v1.AppTest`: new `tests/test_ui_smoke.py` boots the actual `ui/app.py` script against a per-test SQLite fixture and asserts (a) no exceptions at import/boot, (b) the `Finn-Predictor` title renders, (c) all six tab labels appear (Today / History / Sectors / Performance / Focus / Learning), (d) the bootstrap empty-state copy shows on a fresh DB, (e) the seeded UP prediction surfaces in the Today-tab metrics. Catches import-time regressions and tab-strip drift that the pure-helper tests couldn't. ``app.py`` stays out of `.coveragerc` (AppTest runs the script in its own context, so line coverage isn't captured) but is now exercised by 4 explicit regression tests.
+- 2026-05-20 — Pluggable story clustering: new `storage/clustering.py` with a `Clusterer` Protocol, the existing 8-word-prefix matcher exposed as `PrefixClusterer` (default), and a new `EmbeddingClusterer` that batched-embeds input + candidate headlines and clusters by cosine ≥ 0.7 (`DEFAULT_COSINE_THRESHOLD`). Sentence-transformers is lazy-loaded with the default model `all-MiniLM-L6-v2`; injectable `embed_fn` keeps tests hermetic. Failed embeddings log a WARNING and fall back to the prefix matcher rather than blanking the column. Selection via `FINN_PREDICTOR_CLUSTERER`; the two UI call sites (Today-tab article rows and the explanation block) now route through `resolve_active_clusterer()`.
 
 ---
 
@@ -384,13 +385,15 @@ python3 -m venv .venv
 constituent-cap / scorer-mismatch / UI-smoke follow-up):
 
 ```
-392 passed
-TOTAL  ~2310 stmts at 96% line+branch coverage
+409 passed
+TOTAL  ~2440 stmts at 96% line+branch coverage
 ```
 
-11 further tests landed in the follow-up sprint: 2 constituent-cap
+28 further tests landed in the follow-up sprint: 2 constituent-cap
 tests in `test_jobs.py`, 5 scorer-mismatch tests in `test_sentiment.py`,
-and 4 Streamlit `AppTest` smoke tests in the new `test_ui_smoke.py`.
+4 Streamlit `AppTest` smoke tests in the new `test_ui_smoke.py`, and 17
+clustering tests in the new `test_clustering.py` covering both the
+prefix and embedding clusterers + the env-driven resolver.
 The UI smoke layer doesn't lift `ui/app.py` line coverage (AppTest
 runs the script in its own context), but it now sits behind four
 explicit regression tests for import-time crashes, missing tab labels,

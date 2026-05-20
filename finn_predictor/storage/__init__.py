@@ -13,6 +13,12 @@ from finn_predictor.storage.models import (
     Sector,
     SentimentScore,
 )
+from finn_predictor.storage.clustering import (
+    Clusterer,
+    EmbeddingClusterer,
+    PrefixClusterer,
+    resolve_active_clusterer,
+)
 from finn_predictor.storage.stories import earliest_story_times, story_key
 from finn_predictor.storage.symbol_names import (
     WELL_KNOWN_NAMES,
@@ -23,8 +29,11 @@ from finn_predictor.storage.symbol_names import (
 __all__ = [
     "AppSetting",
     "Base",
+    "Clusterer",
+    "EmbeddingClusterer",
     "LearnedWeight",
     "NewsArticle",
+    "PrefixClusterer",
     "PriceBar",
     "Prediction",
     "PredictionOutcome",
@@ -37,5 +46,6 @@ __all__ = [
     "expand_symbol",
     "expand_symbol_short",
     "init_db",
+    "resolve_active_clusterer",
     "story_key",
 ]
