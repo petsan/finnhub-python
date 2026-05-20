@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
-from finn_predictor.storage.models import PredictionOutcome, Sector
+import pytest
+
+from finn_predictor.storage.models import NewsArticle, PredictionOutcome, Sector
 from finn_predictor.storage.repo import (
     save_outcome,
     save_prediction,
@@ -12,9 +15,11 @@ from finn_predictor.storage.repo import (
     upsert_articles,
 )
 from finn_predictor.ui.app import (
+    _parse_symbols,
     latest_market_prediction,
     prediction_history,
     recent_headlines,
+    run_ingestion_with_key,
     sector_grid,
 )
 from tests.conftest import make_article, make_prediction, make_score
@@ -106,3 +111,96 @@ def test_sector_grid_one_row_per_sector(session) -> None:
     energy = df[df["etf"] == "XLE"].iloc[0]
     assert tech["label"] == "UP"
     assert energy["label"] == "—"
+
+
+# ---------------- sidebar-supplied API key plumbing ----------------
+
+
+def test_parse_symbols_handles_csv_variants() -> None:
+    assert _parse_symbols("") == []
+    assert _parse_symbols("   ") == []
+    assert _parse_symbols("aapl") == ["AAPL"]
+    assert _parse_symbols("AAPL, msft , , NVDA") == ["AAPL", "MSFT", "NVDA"]
+
+
+def test_run_ingestion_with_key_rejects_empty_key(session) -> None:
+    with pytest.raises(ValueError):
+        run_ingestion_with_key(session, api_key="")
+    with pytest.raises(ValueError):
+        run_ingestion_with_key(session, api_key="   ")
+
+
+def test_run_ingestion_with_key_builds_client_and_runs(session) -> None:
+    """The helper must construct a Finnhub client with the in-session key
+    and route through run_daily_ingest. We patch both the Client constructor
+    and run_daily_ingest to keep the test offline.
+    """
+    fake_counts = {
+        "general_news": 7,
+        "company_news": 0,
+        "market_prices": 1,
+        "sector_prices": 11,
+        "company_prices": 0,
+        "scored": 7,
+        "predictions": 1,
+    }
+
+    with patch("finn_predictor.ui.app.FinnhubClient") as mock_cls, patch(
+        "finn_predictor.ui.app.run_daily_ingest", return_value=fake_counts
+    ) as mock_run:
+        mock_cls.return_value.close = lambda: None
+        out = run_ingestion_with_key(
+            session,
+            api_key="sk-session-only",
+            rate_limit_per_minute=10,
+            company_symbols=["AAPL", "MSFT"],
+        )
+
+    mock_cls.assert_called_once_with(api_key="sk-session-only")
+    assert mock_run.called
+    kwargs = mock_run.call_args.kwargs
+    assert kwargs["company_symbols"] == ["AAPL", "MSFT"]
+    assert out == fake_counts
+
+
+def test_run_ingestion_with_key_closes_client_on_exception(session) -> None:
+    """Even if run_daily_ingest raises, the key-bearing client must be closed."""
+    with patch("finn_predictor.ui.app.FinnhubClient") as mock_cls, patch(
+        "finn_predictor.ui.app.run_daily_ingest", side_effect=RuntimeError("boom")
+    ):
+        client_instance = mock_cls.return_value
+        with pytest.raises(RuntimeError, match="boom"):
+            run_ingestion_with_key(session, api_key="sk-x")
+        client_instance.close.assert_called_once_with()
+
+
+def test_api_key_is_never_persisted_to_db(session) -> None:
+    """No table should contain the API key after a successful ingestion."""
+    api_key = "sk-leak-canary-9f7c"
+
+    fake_counts = {
+        "general_news": 0,
+        "company_news": 0,
+        "market_prices": 0,
+        "sector_prices": 0,
+        "company_prices": 0,
+        "scored": 0,
+        "predictions": 0,
+    }
+
+    with patch("finn_predictor.ui.app.FinnhubClient") as mock_cls, patch(
+        "finn_predictor.ui.app.run_daily_ingest", return_value=fake_counts
+    ):
+        mock_cls.return_value.close = lambda: None
+        run_ingestion_with_key(session, api_key=api_key)
+
+    # Walk every text column we have and assert the canary doesn't appear.
+    cols_to_scan = [
+        (NewsArticle, "headline"),
+        (NewsArticle, "summary"),
+        (NewsArticle, "url"),
+        (NewsArticle, "source"),
+    ]
+    for model, attr in cols_to_scan:
+        for row in session.query(model).all():
+            assert api_key not in (getattr(row, attr) or "")

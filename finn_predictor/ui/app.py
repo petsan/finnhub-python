@@ -4,8 +4,11 @@ Run with::
 
     streamlit run finn_predictor/ui/app.py
 
-The UI is deliberately read-only — it never calls Finnhub directly; it
-renders whatever the ingestion job has persisted.
+The UI itself never calls Finnhub directly — it renders whatever the
+ingestion job has persisted. Users supply a Finnhub API key through a
+sidebar input; that key lives **only** in :data:`streamlit.session_state`
+(server-side, in-memory, cleared on tab/server close) and is never written
+to disk or to the database.
 """
 
 from __future__ import annotations
@@ -15,10 +18,14 @@ from typing import Iterable
 
 import pandas as pd
 import streamlit as st
+from finnhub import Client as FinnhubClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from finn_predictor.config import load_settings
+from finn_predictor.ingestion.client import FinnhubGateway, RateLimiter
+from finn_predictor.ingestion.jobs import run_daily_ingest
+from finn_predictor.sentiment.vader import VaderScorer
 from finn_predictor.storage import create_engine_and_session, init_db
 from finn_predictor.storage.models import (
     NewsArticle,
@@ -28,6 +35,9 @@ from finn_predictor.storage.models import (
     SentimentScore,
 )
 from finn_predictor.storage.repo import all_sectors, predictions_for
+
+
+API_KEY_SESSION_KEY = "finnhub_api_key"
 
 
 # -- Data helpers (pure, testable) ----------------------------------------
@@ -144,17 +154,132 @@ def sector_grid(session: Session, sectors: Iterable[Sector]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# -- Streamlit page (best-effort smoke-tested) ----------------------------
+# -- Ingestion helper (pure; testable without Streamlit) ------------------
 
 
-def main() -> None:  # pragma: no cover - thin glue exercised by AppTest
+def run_ingestion_with_key(
+    session: Session,
+    *,
+    api_key: str,
+    rate_limit_per_minute: int = 55,
+    company_symbols: Iterable[str] = (),
+) -> dict[str, int]:
+    """Construct a Finnhub gateway with the given key and run one ingestion.
+
+    The key is held only inside the locally-scoped :class:`FinnhubClient` for
+    the duration of this call. It is never persisted, logged, or returned in
+    the result dict.
+    """
+    if not api_key or not api_key.strip():
+        raise ValueError("api_key must be a non-empty string")
+
+    client = FinnhubClient(api_key=api_key)
+    try:
+        gateway = FinnhubGateway(
+            client=client,
+            rate_limiter=RateLimiter(rate_limit_per_minute),
+        )
+        counts = run_daily_ingest(
+            session=session,
+            gateway=gateway,
+            scorer=VaderScorer(),
+            company_symbols=list(company_symbols),
+        )
+    finally:
+        # Explicitly close the requests.Session so the key-bearing connection
+        # pool doesn't sit around in memory longer than needed.
+        client.close()
+    return counts
+
+
+# -- Streamlit page (thin glue, exercised only via the dev server) --------
+
+
+def _render_sidebar() -> tuple[str | None, str]:  # pragma: no cover - Streamlit UI
+    """Render the API-key sidebar.
+
+    Returns ``(triggered_key, symbols_csv)`` — ``triggered_key`` is the
+    current in-session key iff the user clicked "Run ingestion now" this
+    render, otherwise ``None``.
+    """
+    with st.sidebar:
+        st.header("Finnhub API key")
+        st.caption(
+            "Required to fetch news and prices. Stored **only** in this "
+            "browser tab's server-side session — never written to disk or "
+            "the database. Closing the tab or restarting the server "
+            "discards it."
+        )
+        st.text_input(
+            "API key",
+            type="password",
+            key=API_KEY_SESSION_KEY,
+            placeholder="paste your key here",
+            help="Your free key from https://finnhub.io/dashboard",
+        )
+
+        current = (st.session_state.get(API_KEY_SESSION_KEY) or "").strip()
+        if current:
+            st.success("✓ key set for this session")
+        else:
+            st.warning("no key set — ingestion disabled")
+
+        symbols_csv = st.text_input(
+            "Company tickers (optional, comma-separated)",
+            value="",
+            placeholder="AAPL, MSFT, NVDA",
+        )
+
+        col_clear, col_run = st.columns(2)
+        with col_clear:
+            if st.button("Clear key", disabled=not current):
+                st.session_state.pop(API_KEY_SESSION_KEY, None)
+                st.rerun()
+        with col_run:
+            run_clicked = st.button("Run ingestion now", disabled=not current)
+
+    triggered = current if (current and run_clicked) else None
+    return triggered, symbols_csv
+
+
+def _parse_symbols(csv: str) -> list[str]:
+    """Split a comma-separated ticker string. Empty → empty list. Public for tests."""
+    return [s.strip().upper() for s in csv.split(",") if s.strip()]
+
+
+def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
     st.set_page_config(page_title="Finn-Predictor", layout="wide")
 
-    settings = load_settings()
+    # UI must boot even without a key — load_settings(require_api_key=False)
+    # returns Settings with an empty finnhub_api_key, which the UI never
+    # reads. The actual key comes from st.session_state set by the sidebar.
+    settings = load_settings(require_api_key=False)
     engine, SessionLocal = create_engine_and_session(settings.database_url)
     init_db(engine)
 
+    triggered_key, symbols_csv = _render_sidebar()
+
     with SessionLocal() as session:
+        if triggered_key:
+            symbols = _parse_symbols(symbols_csv)
+            with st.spinner("Ingesting news & prices…"):
+                try:
+                    counts = run_ingestion_with_key(
+                        session,
+                        api_key=triggered_key,
+                        rate_limit_per_minute=settings.rate_limit_per_minute,
+                        company_symbols=symbols,
+                    )
+                    st.sidebar.success(
+                        f"Done — articles +{counts['general_news']}, "
+                        f"scored {counts['scored']}, "
+                        f"predictions {counts['predictions']}"
+                    )
+                except Exception as exc:
+                    # NB: never echo the key in errors. FinnhubAPIException
+                    # already redacts the URL; we only show the message.
+                    st.sidebar.error(f"Ingestion failed: {exc}")
+
         st.title("Finn-Predictor")
         tab_today, tab_history, tab_sectors = st.tabs(
             ["Today", "History", "Sectors"]
@@ -163,7 +288,7 @@ def main() -> None:  # pragma: no cover - thin glue exercised by AppTest
         with tab_today:
             pred = latest_market_prediction(session)
             if pred is None:
-                st.info("No predictions yet. Run the ingestion job to populate.")
+                st.info("No predictions yet. Paste an API key in the sidebar and click *Run ingestion now*.")
             else:
                 cols = st.columns(3)
                 cols[0].metric("Call", pred.label)

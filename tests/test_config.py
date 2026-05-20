@@ -43,3 +43,15 @@ def test_settings_is_frozen() -> None:
     s = Settings(finnhub_api_key="k")
     with pytest.raises(Exception):
         s.finnhub_api_key = "other"  # type: ignore[misc]
+
+
+def test_load_settings_optional_key_returns_empty_string() -> None:
+    """UI bootstrap path: no key set, but we still get a usable Settings."""
+    s = load_settings({}, require_api_key=False)
+    assert s.finnhub_api_key == ""
+    assert s.database_url == DEFAULT_DB_URL
+
+
+def test_load_settings_optional_still_returns_explicit_key() -> None:
+    s = load_settings({"FINNHUB_API_KEY": "abc"}, require_api_key=False)
+    assert s.finnhub_api_key == "abc"

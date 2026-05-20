@@ -66,3 +66,8 @@ target/
 #Ipython Notebook
 .ipynb_checkpoints
 .DS_Store
+
+# Finn-Predictor local runtime artefacts
+finn_predictor.db
+*.sqlite
+*.sqlite3

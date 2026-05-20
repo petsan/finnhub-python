@@ -33,17 +33,29 @@ class Settings:
     rate_limit_per_minute: int = 55
 
 
-def load_settings(env: dict[str, str] | None = None) -> Settings:
+def load_settings(
+    env: dict[str, str] | None = None,
+    *,
+    require_api_key: bool = True,
+) -> Settings:
     """Build a Settings from an env mapping (defaults to ``os.environ``).
 
+    Args:
+        env: Override mapping. Useful in tests; production callers pass nothing.
+        require_api_key: When True (default), refuse to return a Settings
+            with an empty key — CLI / batch scripts always want this.
+            When False, return a Settings with an empty key; the caller is
+            then responsible for supplying it through another channel
+            (e.g. the Streamlit UI accepts it per-session in memory).
+
     Raises:
-        RuntimeError: if ``FINNHUB_API_KEY`` is not set. We refuse to start
-            up silently with a placeholder because Finnhub would just 401 and
-            we'd write nothing to the DB.
+        RuntimeError: if ``require_api_key`` is True and ``FINNHUB_API_KEY``
+            is not set. We refuse to start up silently with a placeholder
+            because Finnhub would just 401 and we'd write nothing to the DB.
     """
     source = os.environ if env is None else env
     api_key = source.get("FINNHUB_API_KEY", "").strip()
-    if not api_key:
+    if require_api_key and not api_key:
         raise RuntimeError(
             "FINNHUB_API_KEY is not set. Export it before starting "
             "finn-predictor (e.g. `export FINNHUB_API_KEY=...`)."
