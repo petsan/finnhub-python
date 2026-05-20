@@ -5,7 +5,7 @@ chronological (oldest → newest) order. The upstream `finnhub-python`
 library itself (`finnhub/`, `setup.py`, etc.) is **untouched**; everything
 new lives under `finn_predictor/`, `tests/`, and a few config files.
 
-Totals across the branch: **75 files changed, ~15,800 insertions(+),
+Totals across the branch: **88 files changed, ~22,350 insertions(+),
 3 deletions(-)** vs. `master` (commit `c94e7d4 release 2.4.28`).
 
 ---
@@ -677,9 +677,9 @@ dependencies — `sentence-transformers` is opt-in.
 
 ---
 
-## HEAD — docs + Proxmox deployment script
+## f355ee4 — deploy: Proxmox LXC installer + deployment manual + doc refresh
 
-*8 files, +~1200 / −few*
+*7 files, +1277 / −5*
 
 Deployment story rounded out:
 
@@ -713,6 +713,279 @@ Deployment story rounded out:
 
 No production code changed; 409 tests still pass.
 
+Verified end-to-end on a live Proxmox 9.1 node:
+* Cluster-wide free-CTID lookup picked the right ID via
+  `pvesh get /cluster/nextid`.
+* `--local-source` path packaged and pushed cleanly (.git excluded).
+* Inner script detected the pre-seeded tree (no `.git` → skip clone).
+* venv + pip install + systemd unit installed, service started.
+* `GET /_stcore/health` returned 200 from both inside and outside
+  the container.
+
+---
+
+## 729da7a — predictor: quantile-band magnitude prediction (opt-in)
+
+*19 files, +1217 / −6*
+
+Adds the magnitude mode discussed in the chat exchange about "can it
+predict how much the market will move". Honest about uncertainty by
+design: the band is wide because the underlying signal carries only
+single-digit-percent variance explanation, and a single-number
+forecast would imply precision the data can't support.
+
+New module `finn_predictor/predictor/magnitude.py`:
+
+* `MagnitudeForecast(p10, p50, p90)` dataclass with crossed-quantile
+  sort defence (a fit that crosses on small data silently reorders
+  so the UI never shows lower > upper).
+* `MagnitudeCalibration`: three `QuantileFit` rows (one per tau in
+  `DEFAULT_QUANTILES = (0.10, 0.50, 0.90)`), plus `n_samples` and
+  `feature_name` for future-version mismatch detection.
+* `_fit_quantile_regression_1d`: pure-Python pinball-loss
+  minimisation via subgradient descent. Warm-starts intercept at the
+  y-median and tracks the best-objective parameters seen.
+* `fit_quantile_calibration`: walks closed predictions, raises
+  `NotEnoughMagnitudeDataError` when n < `MIN_FIT_SAMPLES=15` or
+  when realised_return has zero variance.
+* `save_calibration` / `load_calibration`: JSON in a single
+  `AppSetting` row (key `magnitude_calibration`), mirroring the
+  logreg classifier pattern.
+* `resolve_magnitude_mode`: env-driven picker, defaults to `off`,
+  silently falls back from unknown values.
+
+Schema: three nullable Float columns on Prediction —
+`expected_return_p10`, `_p50`, `_p90`. New `_add_missing_columns`
+helper in `storage/engine.py` runs idempotent ALTER TABLE ADD COLUMN
+on `init_db`, so DBs written by older deploys upgrade in place when
+the service restarts. Verified via `tests/test_engine_migrations.py`.
+
+Predictor wiring: `predict_market` / `predict_sector` /
+`predict_stock` take an optional `magnitude_calibration` kwarg.
+`save_prediction`'s upsert no-ops on null magnitude columns
+specifically, so a re-run without the calibration doesn't erase a
+band written by a prior run with it.
+
+CLI: new `python -m finn_predictor.cli fit-magnitude` mirrors
+`fit-classifier`. Filters the training set by the active scorer's
+`model_version` so VADER + FinBERT predictions never mix.
+
+UI: `format_expected_move(prediction)` renders the band as
+`-0.80% to +1.20% (median +0.20%)`. Today tab calls
+`_render_expected_move` under the market metrics; the row is hidden
+when the band isn't populated.
+
+Tests: +29 (21 in `test_magnitude.py`, 3 in
+`test_engine_migrations.py`, +2 in `test_cli.py`, +3 in
+`test_ui_helpers.py`). Net: 409 → 438 passing.
+
+---
+
+## 7ec83b1 — ui: neutral-headlines section + actionable Sectors-tab empty state
+
+*3 files, +237 / −2*
+
+Two UX fixes prompted by the live deploy walkthrough.
+
+**Neutral headlines** (new section under Recent headlines on the
+Today tab): articles in the prediction's window whose scorer-extracted
+sentiment sits at or below `NEUTRAL_SENTIMENT_THRESHOLD=0.05` — i.e.
+the model saw them but couldn't extract polarity. Surfacing them
+keeps the reader honest about base rates while keeping the
+contribution-ranked view free of noise. The threshold is locked to
+`predictor.explain.FLAT_SUPPORT_BAND` (tested) so the
+"this didn't move the Call" cutoff stays consistent across UI
+sections.
+
+**Sectors-tab empty state**: previously displayed "Sectors not
+seeded yet — run an ingestion cycle" whenever the latest-prediction-
+per-sector grid was empty, which was misleading because the 11
+default sectors ARE seeded on first ingest. Now distinguishes three
+shapes:
+
+* No sectors in the DB → original message.
+* Sectors seeded but no `ETF_HOLDING` cached → actionable nudge
+  pointing at Focus → Sector → Refresh constituents.
+* Sectors + ETF_HOLDING cached but no `company` articles in the
+  window → nudge to run ingestion / backfill.
+
+Tests: +6 in `test_ui_helpers.py` (neutral-filter cutoff, recency
+ordering, limit, threshold override, empty input,
+FLAT_SUPPORT_BAND parity). Net: 438 → 444 passing.
+
+---
+
+## c39b7ca — cli: refresh-constituents — headless equivalent of UI Refresh button
+
+*4 files, +264 / −0*
+
+Mirrors the Focus → Sector → Refresh constituents button as a CLI
+subcommand so cron / containers / headless ops can populate
+`RelatedEntity(ETF_HOLDING)` without going through Streamlit.
+
+```
+python -m finn_predictor.cli refresh-constituents
+python -m finn_predictor.cli refresh-constituents --etf XLK --etf XLV
+python -m finn_predictor.cli refresh-constituents --limit 50
+```
+
+Behaviour:
+
+* Reads `FINNHUB_API_KEY` from env (rc=2 + friendly message when
+  unset, same shape as `cli ingest` / `fit-classifier`).
+* Rejects an unseeded DB (rc=2) rather than silently no-op — keeps
+  the failure mode legible.
+* Iterates every `Sector` row by default; `--etf <SYMBOL>`
+  (repeatable) scopes the run, `--limit` caps constituents per
+  sector (default 25).
+* Resilient: per-sector `IngestionError` (free-tier 403 on
+  `/etf/holdings`, rate-limit) lands in `summary["failures"]`
+  without blocking peers.
+* Prints a JSON summary listing refreshed sectors, per-sector
+  failures, and skipped sectors (when `--etf` is used).
+
+Tests: +5 in `test_cli.py` (requires-api-key, rejects-unseeded-db,
+happy-path, isolates-per-sector-failures, filter-by-etf). Net:
+444 → 449 passing.
+
+**Live note**: a real run on the deployed instance surfaced that
+the user's Finnhub free-tier plan gates `/etf/holdings` (every
+sector got 403'd). The CLI worked exactly as designed — per-sector
+resilient failure isolation, structured JSON output — but exposed
+that sector synthesis needs another path on free tier. That
+becomes the curated map in `fdf4133`.
+
+---
+
+## ac5551d — ui: persist Finnhub API key in browser localStorage
+
+*6 files, +202 / −11*
+
+Adds the persistence the sidebar lacked: the API token now survives
+page reloads via `window.localStorage`, and the *Clear key* button
+wipes both the server session and the browser cache in one atomic
+click.
+
+Implementation:
+
+* New constants: `BROWSER_STORAGE_API_KEY` (the localStorage key,
+  prefixed with `finn_predictor_` so we don't collide with other
+  Streamlit apps on the same origin) plus two `session_state`
+  markers for change detection and one-shot hydration.
+* `_get_local_storage()` — defensive constructor wrapper around
+  `streamlit-local-storage`'s `LocalStorage()`. Returns `None` instead
+  of hanging when:
+    1. The package isn't installed (ImportError).
+    2. `FINN_PREDICTOR_DISABLE_LOCAL_STORAGE` is truthy — explicit
+       opt-out for tests / scripts / users who want the legacy
+       session-only behaviour.
+    3. The constructor raises for any other reason.
+* `_hydrate_api_key_from_browser()` — runs at most once per session
+  BEFORE the text_input renders. Reads localStorage, pre-fills
+  `st.session_state[API_KEY_SESSION_KEY]`. Bypassed cleanly when
+  localStorage isn't reachable.
+* `_persist_api_key_to_browser(api_key)` — change-detected
+  writeback. Avoids spamming the component bridge on every rerun.
+* `_clear_browser_api_key()` — wired into the *Clear key* button.
+  Atomic wipe: server session + browser cache + hydrate flag in
+  one click.
+
+Why the escape hatch: `streamlit-local-storage`'s `__init__` polls
+`st.session_state` until the frontend custom component reports back —
+fine under `streamlit run`, but it never exits under
+`streamlit.testing.v1.AppTest` (component JS doesn't execute),
+hanging the entire smoke-test suite. The DISABLE env var lets the
+test fixture skip the bridge while preserving the production path.
+
+Sidebar caption updated to reflect the new posture: the key now
+"persists in this browser's localStorage" but "never written to the
+server's disk or the SQLite database" — both still true,
+distinguishing client-side from server-side storage.
+
+Dependency: `streamlit-local-storage>=0.0.20` added to
+`requirements.txt`. Self-contained Streamlit component with a
+bundled frontend bundle; no transitive heavyweight deps.
+
+Tests: +4 in `test_ui_helpers.py`. Net: 449 → 453 passing.
+
+---
+
+## fdf4133 — ui+jobs: ^GSPC price chart + sector-grouped stocks + curated synthesis
+
+*7 files, +648 / −37*
+
+Two features in one commit because they share the goal of making
+the Today tab useful on a free-tier Finnhub deploy where
+`/etf/holdings` returns 403 and the Sectors tab would otherwise be
+blank.
+
+**Curated ticker → sector membership** (new module):
+
+* `finn_predictor/storage/sector_membership.py` — ~110 mega-cap
+  tickers across the 11 SPDR sectors, hardcoded. Public knowledge
+  (top holdings of each Sector Select SPDR ETF as of mid-2025).
+* `sector_for_ticker(symbol)` — normalises case + whitespace,
+  returns the sector code or None for the long tail.
+* `sector_universe_from_tickers(tickers)` — builds the
+  `{sector_code: [ticker, …]}` shape `predict_all_sectors`
+  consumes. Dedupes, preserves user-input order, silently drops
+  unmapped symbols.
+* `merge_sector_universes(primary, secondary)` — unions two
+  universe dicts; primary wins on ordering. Used by the ingest
+  job to combine cached ETF_HOLDING with the curated fallback.
+
+**Daily-ingest wiring** (`jobs.py`):
+
+`run_daily_ingest` now builds a merged sector universe before
+calling `predict_all_sectors`. Primary: cached
+`RelatedEntity(ETF_HOLDING)` rows (paid-plan path). Secondary:
+curated map applied to the user's `company_symbols` (free-tier
+fallback). Sectors with at least one constituent from either
+source produce predictions.
+
+**UI Today-tab — ^GSPC price chart** (new):
+
+`build_market_price_chart(bars, *, symbol, days)` — pure helper
+returning an Altair line chart with `.interactive()` for mouse-
+wheel zoom + click-drag pan. Y-axis padded ±5% so daily candles
+don't get crushed. Hidden when no bars exist.
+
+**UI Today-tab — sector-grouped stock predictions** (changed):
+
+`group_stock_predictions_by_sector` buckets predictions by curated
+sector code, returns `([(Sector, [pred, …]), …], [unmapped, …])`.
+The Today tab replaces the single flat dataframe with one section
+per sector, each header showing the synthesized sector prediction
+when available. "Other / unmapped" section appears below for
+tickers not in the curated map.
+
+Tests: +18 (13 in `test_sector_membership.py`, +5 in
+`test_ui_helpers.py`). Net: 453 → 472 passing.
+
+---
+
+## HEAD — docs: bring summary.md / progress.md / diff.md current (this commit)
+
+*~3 files, ~+400 / −few*
+
+Catch-up docs sweep capturing the five-commit run between
+`f355ee4` and `fdf4133`:
+
+* `progress.md` §3.6: all originally-open limitations are now
+  struck through (magnitude, scorer toggle, classifier mode,
+  clusterer, cap weighting, constituent caps, free-tier sector
+  fallback). §5.4 test posture refreshed to 472 passing / 96%
+  coverage. §4 changelog gets four new dated entries.
+* `summary.md`: Features table gains four rows (Magnitude band,
+  Neutral headlines, refresh-constituents CLI, localStorage
+  persistence, curated sector synthesis, price chart). Test
+  posture line bumped to 472.
+* `diff.md`: per-commit blocks for `729da7a`, `7ec83b1`,
+  `c39b7ca`, `ac5551d`, `fdf4133`, each at the same level of
+  detail as the prior entries.
+
+No application code changed; 472 tests still pass.
+
 ---
 
 ## Files added (by directory)
@@ -727,29 +1000,36 @@ finn_predictor/
   learning/
     __init__.py · config.py · simulate.py · train.py
   predictor/
-    __init__.py · aggregate.py · backtest.py · explain.py · focus.py ·
-    market.py · sectors.py · stocks.py · trades.py
+    __init__.py · aggregate.py · backtest.py · classifier.py ·
+    explain.py · focus.py · magnitude.py · market.py · sectors.py ·
+    stocks.py · trades.py
   sentiment/
     __init__.py · base.py · finbert.py · vader.py
   storage/
-    __init__.py · engine.py · models.py · repo.py · stories.py ·
-    symbol_names.py
+    __init__.py · clustering.py · engine.py · models.py · repo.py ·
+    sector_membership.py · stories.py · symbol_names.py
   ui/
     __init__.py · app.py
+deploy/
+  proxmox/install.sh
 
 tests/
   __init__.py · conftest.py · test_aggregate.py · test_backfill.py ·
-  test_backtest.py · test_cli.py · test_config.py · test_explain.py ·
-  test_focus.py · test_ingestion_client.py · test_ingestion_news_prices.py ·
-  test_jobs.py · test_learning.py · test_logging_config.py ·
-  test_predictor_market.py · test_predictor_sectors.py ·
-  test_predictor_stocks.py · test_prices_yf.py · test_security.py ·
+  test_backtest.py · test_classifier.py · test_cli.py ·
+  test_clustering.py · test_config.py · test_engine_migrations.py ·
+  test_explain.py · test_focus.py · test_ingestion_client.py ·
+  test_ingestion_news_prices.py · test_jobs.py · test_learning.py ·
+  test_logging_config.py · test_magnitude.py · test_predictor_market.py ·
+  test_predictor_sectors.py · test_predictor_stocks.py ·
+  test_prices_yf.py · test_sector_membership.py · test_security.py ·
   test_sentiment.py · test_storage_repo.py · test_stories.py ·
-  test_symbol_names.py · test_trades.py · test_ui_helpers.py
+  test_symbol_names.py · test_trades.py · test_ui_helpers.py ·
+  test_ui_smoke.py
 
 progress.md · summary.md · diff.md · user-manual.md ·
-installation-manual.md · pytest.ini · .coveragerc · requirements.txt ·
-Dockerfile · docker-compose.yml · docker/entrypoint.sh · .dockerignore
+installation-manual.md · deployment-manual.md · pytest.ini ·
+.coveragerc · requirements.txt · Dockerfile · docker-compose.yml ·
+docker/entrypoint.sh · .dockerignore
 ```
 
 ## Files in the upstream library that were NOT touched

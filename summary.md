@@ -138,6 +138,11 @@ of up to a year.
 | Pluggable story clustering | Default 8-word-prefix matcher catches identical-lead reposts; `FINN_PREDICTOR_CLUSTERER=embedding` switches to sentence-transformers cosine clustering (lazy-loaded, ~80 MB on first use, default model `all-MiniLM-L6-v2`). The embedding path catches paraphrased rewrites the prefix matcher misses. Falls back to prefix on embed failure. |
 | Proxmox LXC installer | `deploy/proxmox/install.sh` provisions an unprivileged Ubuntu 24.04 LXC, installs Python + the app, drops a hardened systemd unit, starts Streamlit on port 8501. Idempotent re-runs upgrade in place; `--remove` tears down cleanly. `deployment-manual.md` covers reverse proxy + TLS, backups, monitoring, hardening. |
 | Magnitude band (opt-in) | `FINN_PREDICTOR_MAGNITUDE=quantile` plus a fitted calibration adds a 10th–90th-percentile return band to each prediction. Three new nullable columns on `Prediction`; pinball-loss quantile regression on closed outcomes; fit via `python -m finn_predictor.cli fit-magnitude`. UI Today-tab renders the band as `-0.8% to +1.2% (median +0.2%)`. Honest about uncertainty by design — the band is wide because sentiment-only signal can't claim more. |
+| Neutral headlines | Today tab surfaces articles with `|sentiment| ≤ 0.05` (locked to the same `FLAT_SUPPORT_BAND` the classifier uses) in their own section under *Recent headlines*, sorted by recency. Keeps the reader honest about how much of the day's news flow the model actively used versus shrugged at. |
+| ^GSPC price chart | Today tab opens with a 30-day Altair line chart of S&P 500 daily closes — scroll wheel zooms, click-drag pans. Hidden when no price bars exist. |
+| Sector grouping + curated synthesis | Per-stock predictions on the Today tab are bucketed by curated `ticker → SPDR-sector` membership, with each section header showing a *synthesized* sector prediction aggregated from the user-listed stocks in that sector. Lets free-tier deploys produce sector predictions without Finnhub's gated `/etf/holdings`; cached `ETF_HOLDING` rows (paid plan) merge cleanly with the curated fallback. |
+| Headless `refresh-constituents` | `python -m finn_predictor.cli refresh-constituents [--etf SYMBOL]... [--limit N]` mirrors the Focus → Sector → Refresh constituents button so cron / containers / batch ops can populate `ETF_HOLDING` without going through Streamlit. Per-sector resilient failure isolation; JSON output. |
+| Browser-localStorage API-key persistence | Sidebar pre-fills the Finnhub key from `window.localStorage` on load; survives `Ctrl+R`. *Clear key* atomically wipes both server session and browser cache. Server-side scrubbing layers unchanged — the key still never writes to disk or the DB. Disable via `FINN_PREDICTOR_DISABLE_LOCAL_STORAGE=1` for the legacy session-only behaviour. |
 | Postgres support | Set `FINN_PREDICTOR_DB_URL="postgresql+psycopg://..."` — the upserts are dialect-aware. `psycopg[binary]` ships in default requirements. |
 | Structured logging | `FINN_PREDICTOR_LOG_FORMAT=json` switches to one-record-per-line JSON output suitable for log aggregators. |
 | Docker | `docker compose up --build` builds and starts the app on host 8501. Named volume keeps the SQLite DB across `down`. `RESET_DB=1` wipes on next start. `docker compose run --rm app ingest|retrain|reset-db|shell|hash-password` for headless ops. Runs as non-root. |
@@ -172,7 +177,7 @@ Every external HTTP call goes through `FinnhubGateway` (Finnhub) or an
 injectable `history_fn` (yfinance), both mocked in tests — **no test
 makes a real network call**. SQLite-backed tests run against `:memory:`
 per-test, giving fast and isolated coverage. As of the latest commit:
-**438 tests passing at 96% line+branch coverage** across the
+**472 tests passing at 96% line+branch coverage** across the
 `finn_predictor` package.
 
 See `progress.md` for the design doc, `diff.md` for the per-commit
