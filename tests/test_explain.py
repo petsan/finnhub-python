@@ -155,6 +155,12 @@ def test_article_contributions_supports_call_flat(session) -> None:
 
 def test_article_contributions_sector_uses_company_category(session) -> None:
     """Non-^GSPC targets filter on company-category articles."""
+    from finn_predictor.storage.repo import ensure_default_sectors
+
+    # Seed sectors so XLK is recognised as a sector ETF (and over-includes
+    # all company news instead of filtering to symbol='XLK').
+    ensure_default_sectors(session)
+
     _seed(session, ids_scores=[(11, 0.8)], day=D, category="general")
     _seed(session, ids_scores=[(12, 0.6)], day=D, category="company", symbol="AAPL")
     pred = save_prediction(
@@ -170,6 +176,25 @@ def test_article_contributions_sector_uses_company_category(session) -> None:
     finnhub_ids = {c.article.finnhub_id for c in contribs}
     # Only the company article counts; the general one is filtered out.
     assert finnhub_ids == {12}
+
+
+def test_article_contributions_stock_scopes_to_ticker_symbol(session) -> None:
+    """For an individual-stock target the article filter must be exact:
+    only that ticker's company news contributes — not other tickers'."""
+    _seed(session, ids_scores=[(20, 0.7)], day=D, category="company", symbol="AAPL")
+    _seed(session, ids_scores=[(21, 0.8)], day=D, category="company", symbol="MSFT")
+    pred = save_prediction(
+        session,
+        make_prediction(
+            target_symbol="AAPL",   # individual stock, NOT in Sector table
+            prediction_date=D,
+            label="UP",
+            model_version="vader-test",
+        ),
+    )
+    contribs = article_contributions(session, prediction=pred)
+    finnhub_ids = {c.article.finnhub_id for c in contribs}
+    assert finnhub_ids == {20}  # AAPL only; MSFT excluded
 
 
 # ---------------- explain_prediction ----------------

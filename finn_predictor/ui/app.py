@@ -68,7 +68,7 @@ def latest_market_prediction(session: Session, symbol: str = "^GSPC") -> Predict
 
 
 def latest_predictions(session: Session) -> list[Prediction]:
-    """One latest Prediction per target_symbol — across market + every sector.
+    """One latest Prediction per target_symbol — across market + every sector + every stock.
 
     Sorted with ``^GSPC`` first (the headline call) then alphabetical by
     target symbol. Returns an empty list when no predictions exist.
@@ -89,6 +89,55 @@ def latest_predictions(session: Session) -> list[Prediction]:
     # Market call first, then sectors alphabetically.
     out.sort(key=lambda p: (p.target_symbol != "^GSPC", p.target_symbol))
     return out
+
+
+def partition_predictions(
+    session: Session, preds: Iterable[Prediction]
+) -> tuple[Prediction | None, list[Prediction], list[Prediction]]:
+    """Split ``preds`` into (market, sectors, stocks).
+
+    Uses the Sector table to recognise sector-ETF targets. Anything
+    that isn't ``^GSPC`` and isn't a registered sector ETF is treated
+    as an individual stock.
+    """
+    sector_etfs = {s.etf_symbol for s in all_sectors(session)}
+    market: Prediction | None = None
+    sectors: list[Prediction] = []
+    stocks: list[Prediction] = []
+    for p in preds:
+        if p.target_symbol == "^GSPC":
+            market = p
+        elif p.target_symbol in sector_etfs:
+            sectors.append(p)
+        else:
+            stocks.append(p)
+    return market, sectors, stocks
+
+
+def stock_predictions_table(
+    session: Session, stock_preds: Iterable[Prediction]
+) -> pd.DataFrame:
+    """DataFrame of per-stock predictions sorted by descending confidence."""
+    rows = []
+    for p in stock_preds:
+        rows.append(
+            {
+                "Company": expand_symbol_short(session, p.target_symbol),
+                "Ticker": p.target_symbol,
+                "Call": p.label,
+                "Confidence": round(p.confidence, 2),
+                "Articles": p.article_count,
+                "Sentiment": round(p.sentiment_index, 3),
+                "As of": p.prediction_date,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(
+            columns=["Company", "Ticker", "Call", "Confidence", "Articles", "Sentiment", "As of"]
+        )
+    df = pd.DataFrame(rows)
+    # Sort by absolute confidence descending so the strongest calls float up.
+    return df.sort_values(["Confidence", "Articles"], ascending=False).reset_index(drop=True)
 
 
 def headlines_from_contributions(
@@ -617,8 +666,8 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
 
         with tab_today:
             preds = latest_predictions(session)
-            market_pred = next(
-                (p for p in preds if p.target_symbol == "^GSPC"), None
+            market_pred, sector_preds, stock_preds = partition_predictions(
+                session, preds
             )
 
             if market_pred is None:
@@ -633,19 +682,28 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                 cols[2].metric("Articles", market_pred.article_count)
 
             # --- Why this Call? ---------------------------------------
-            if preds:
-                if len(preds) == 1:
+            # The explanation block is scoped to the market + sector
+            # predictions. Per-stock predictions get their own compact
+            # table below — explaining each of N stocks in 5 paragraphs
+            # would drown the page.
+            explanation_preds: list[Prediction] = []
+            if market_pred is not None:
+                explanation_preds.append(market_pred)
+            explanation_preds.extend(sector_preds)
+
+            if explanation_preds:
+                if len(explanation_preds) == 1:
                     st.subheader("Why this Call?")
                 else:
                     st.subheader(
-                        f"Why these {len(preds)} Calls? "
-                        f"({len(preds) - 1} sector(s) plus the market)"
+                        f"Why these {len(explanation_preds)} Calls? "
+                        f"({len(sector_preds)} sector(s) plus the market)"
                     )
 
                 # Fixed-height container makes the explanation scrollable
                 # when the per-prediction text gets long.
                 with st.container(height=480):
-                    for i, p in enumerate(preds):
+                    for i, p in enumerate(explanation_preds):
                         long_name = expand_symbol(session, p.target_symbol)
                         st.markdown(
                             f"### {long_name} — **{p.label}** "
@@ -653,8 +711,42 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                             f"{p.article_count} article(s))"
                         )
                         st.markdown(explain_prediction(session, prediction=p))
-                        if i < len(preds) - 1:
+                        if i < len(explanation_preds) - 1:
                             st.divider()
+
+            # --- Per-stock predictions --------------------------------
+            if stock_preds:
+                st.subheader("Per-stock predictions")
+                st.caption(
+                    "Directional call per ticker, computed from that "
+                    "stock's own company-news sentiment. Same classifier "
+                    "as the market call — UP/DOWN/FLAT by z-score against "
+                    "the ticker's 30-day baseline. Sorted by confidence."
+                )
+                stocks_df = stock_predictions_table(session, stock_preds)
+                st.dataframe(
+                    stocks_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Confidence": st.column_config.ProgressColumn(
+                            "Confidence",
+                            min_value=0.0,
+                            max_value=1.0,
+                            format="%.2f",
+                        ),
+                        "Sentiment": st.column_config.NumberColumn(
+                            "Sentiment",
+                            format="%+.3f",
+                            help="Recency-weighted mean of today's "
+                                 "scored articles, on a [-1, +1] scale.",
+                        ),
+                        "As of": st.column_config.DatetimeColumn(
+                            "As of",
+                            format="YYYY-MM-DD",
+                        ),
+                    },
+                )
 
             # --- Contribution chart (per-article, divergent bars) ----
             market_contribs: list[ArticleContribution] = []

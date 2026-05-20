@@ -21,7 +21,12 @@ from sqlalchemy.orm import Session
 
 from finn_predictor.predictor.aggregate import _recency_weight, rolling_baseline
 from finn_predictor.predictor.market import MIN_BASELINE_SIGMA, THRESHOLD_SIGMA
-from finn_predictor.storage.models import NewsArticle, Prediction, SentimentScore
+from finn_predictor.storage.models import (
+    NewsArticle,
+    Prediction,
+    Sector,
+    SentimentScore,
+)
 from finn_predictor.storage.repo import articles_in_window, utc_day_window
 
 
@@ -42,18 +47,27 @@ class ArticleContribution:
     supports_call: bool  # sign of contribution agrees with Prediction.label
 
 
-def _filter_for_prediction(target_symbol: str) -> tuple[Optional[str], Optional[str]]:
+def _filter_for_prediction(
+    session: Session, target_symbol: str
+) -> tuple[Optional[str], Optional[str]]:
     """Map a target symbol to the (category, symbol) used at predict time.
 
-    - "^GSPC" → ("general", None): whole-market predictor pulls general news.
-    - Anything else → ("company", None): sector-ETF predictors pull company
-      news, scoped to a ticker universe that we don't (yet) persist with the
-      prediction. We over-include here; the caller can still inspect each
-      article's `symbol` field.
+    - ``^GSPC`` → ``("general", None)``: whole-market predictor reads
+      general news.
+    - Sector ETFs (rows in the ``Sector`` table) → ``("company", None)``:
+      the predictor passes a ticker universe at call time which we
+      don't persist; we over-include here.
+    - Anything else (individual stock target) → ``("company", target_symbol)``:
+      scope strictly to articles tagged with that ticker.
     """
     if target_symbol == "^GSPC":
         return ("general", None)
-    return ("company", None)
+    sector = session.scalar(
+        select(Sector).where(Sector.etf_symbol == target_symbol)
+    )
+    if sector is not None:
+        return ("company", None)
+    return ("company", target_symbol)
 
 
 def article_contributions(
@@ -68,7 +82,7 @@ def article_contributions(
     are dropped — they didn't actually feed the index. Returned list is
     sorted by |contribution| descending so the UI can pull a top-N.
     """
-    category, symbol = _filter_for_prediction(prediction.target_symbol)
+    category, symbol = _filter_for_prediction(session, prediction.target_symbol)
     start, end = utc_day_window(prediction.prediction_date)
     articles = articles_in_window(
         session, start, end, category=category, symbol=symbol
@@ -158,7 +172,7 @@ def explain_prediction(
     )
 
     # Paragraph 2 — how the index becomes a label.
-    category, _ = _filter_for_prediction(sym)
+    category, _ = _filter_for_prediction(session, sym)
     baseline = rolling_baseline(
         session,
         model_version=prediction.model_version,

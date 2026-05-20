@@ -26,10 +26,12 @@ from finn_predictor.ui.app import (
     headlines_from_contributions,
     latest_market_prediction,
     latest_predictions,
+    partition_predictions,
     prediction_history,
     recent_headlines,
     run_ingestion_with_key,
     sector_grid,
+    stock_predictions_table,
 )
 from tests.conftest import make_article, make_prediction, make_score
 
@@ -227,6 +229,78 @@ def test_headlines_from_contributions_respects_limit(session) -> None:
     ]
     rows = headlines_from_contributions(contribs, limit=5)
     assert len(rows) == 5
+
+
+# ---------------- partition_predictions & stock_predictions_table ----------------
+
+
+def test_partition_predictions_separates_market_sectors_stocks(session) -> None:
+    from finn_predictor.storage.repo import ensure_default_sectors
+    ensure_default_sectors(session)
+
+    market = save_prediction(
+        session,
+        make_prediction(target_symbol="^GSPC", prediction_date=D, label="UP"),
+    )
+    xlk = save_prediction(
+        session,
+        make_prediction(target_symbol="XLK", prediction_date=D, label="FLAT"),
+    )
+    aapl = save_prediction(
+        session,
+        make_prediction(target_symbol="AAPL", prediction_date=D, label="UP"),
+    )
+
+    m, sectors, stocks = partition_predictions(session, [market, xlk, aapl])
+    assert m is not None and m.id == market.id
+    assert [p.target_symbol for p in sectors] == ["XLK"]
+    assert [p.target_symbol for p in stocks] == ["AAPL"]
+
+
+def test_partition_predictions_no_market(session) -> None:
+    from finn_predictor.storage.repo import ensure_default_sectors
+    ensure_default_sectors(session)
+
+    aapl = save_prediction(
+        session,
+        make_prediction(target_symbol="AAPL", prediction_date=D, label="UP"),
+    )
+    m, sectors, stocks = partition_predictions(session, [aapl])
+    assert m is None
+    assert sectors == []
+    assert [p.target_symbol for p in stocks] == ["AAPL"]
+
+
+def test_stock_predictions_table_columns_and_sort(session) -> None:
+    a = make_prediction(
+        target_symbol="AAPL",
+        prediction_date=D,
+        label="UP",
+        confidence=0.42,
+        sentiment_index=0.31,
+        article_count=8,
+    )
+    b = make_prediction(
+        target_symbol="MSFT",
+        prediction_date=D,
+        label="FLAT",
+        confidence=0.10,
+        sentiment_index=0.05,
+        article_count=3,
+    )
+    df = stock_predictions_table(session, [b, a])  # pass MSFT first
+    # Sorted by Confidence DESC then Articles DESC, so AAPL leads.
+    assert list(df["Ticker"]) == ["AAPL", "MSFT"]
+    assert "Company" in df.columns and "Sentiment" in df.columns
+    # Company name expansion was applied.
+    assert df.iloc[0]["Company"] == "Apple Inc."
+
+
+def test_stock_predictions_table_empty_returns_typed_frame(session) -> None:
+    df = stock_predictions_table(session, [])
+    assert df.empty
+    for col in ("Company", "Ticker", "Call", "Confidence", "Articles", "Sentiment"):
+        assert col in df.columns
 
 
 # ---------------- contribution chart ----------------

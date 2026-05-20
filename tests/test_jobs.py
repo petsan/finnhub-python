@@ -142,8 +142,15 @@ def test_run_daily_ingest_isolates_per_company_failures(session) -> None:
 def test_run_daily_ingest_processes_company_symbols(session) -> None:
     gw = MagicMock()
     gw.general_news.return_value = []
+    # Returns enough articles per company that the per-stock predictor
+    # passes the MIN_ARTICLES_FOR_CALL=3 threshold.
     gw.company_news.return_value = [
-        {"id": 99, "datetime": int(D.timestamp()), "headline": "AAPL beats"}
+        {
+            "id": 90 + i,
+            "datetime": int(D.timestamp()) + i,
+            "headline": f"AAPL ships amazing product {i}",
+        }
+        for i in range(5)
     ]
     gw.stock_candles.return_value = {
         "s": "ok",
@@ -163,8 +170,11 @@ def test_run_daily_ingest_processes_company_symbols(session) -> None:
         company_symbols=["AAPL"],
         today=D,
     )
-    assert counts["company_news"] == 1
+    assert counts["company_news"] == 5
     assert counts["company_prices"] == 1
+    # Per-stock prediction was produced and counted.
+    from finn_predictor.storage.repo import predictions_for
+    assert len(predictions_for(session, "AAPL")) == 1
 
 
 def test_build_scheduler_registers_job() -> None:

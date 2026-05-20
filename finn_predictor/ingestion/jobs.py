@@ -24,6 +24,7 @@ from finn_predictor.ingestion.news import ingest_company_news, ingest_general_ne
 from finn_predictor.ingestion.prices import ingest_price_history
 from finn_predictor.predictor.market import predict_market
 from finn_predictor.predictor.sectors import predict_all_sectors
+from finn_predictor.predictor.stocks import predict_all_stocks
 from finn_predictor.sentiment.base import Scorer
 from finn_predictor.storage.models import SentimentScore
 from finn_predictor.storage.repo import (
@@ -139,6 +140,15 @@ def run_daily_ingest(
 
     sector_preds = predict_all_sectors(session, scorer=scorer, on_date=today)
     counts["predictions"] = int(counts["predictions"]) + len(sector_preds)
+
+    # Per-stock predictions for every ticker the user supplied to
+    # company_symbols. Each ticker gets its own Prediction row with
+    # target_symbol=<ticker> so the existing upsert (one row per
+    # ticker per day per model) applies.
+    stock_preds = predict_all_stocks(
+        session, scorer=scorer, symbols=list(company_symbols), on_date=today
+    )
+    counts["predictions"] = int(counts["predictions"]) + len(stock_preds)
 
     counts["failures"] = failures
     return counts
