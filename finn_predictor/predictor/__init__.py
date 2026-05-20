@@ -18,6 +18,14 @@ from finn_predictor.predictor.classifier import (
     fit_logreg_calibration,
     resolve_classifier_mode,
 )
+from finn_predictor.predictor.magnitude import (
+    MagnitudeCalibration,
+    MagnitudeForecast,
+    NotEnoughMagnitudeDataError,
+    QuantileFit,
+    fit_quantile_calibration,
+    resolve_magnitude_mode,
+)
 from finn_predictor.predictor.explain import (
     ArticleContribution,
     article_contributions,
@@ -60,8 +68,12 @@ __all__ = [
     "CompanyFocus",
     "EventFocus",
     "LogisticCalibration",
+    "MagnitudeCalibration",
+    "MagnitudeForecast",
     "NotEnoughCalibrationDataError",
+    "NotEnoughMagnitudeDataError",
     "PerformanceSummary",
+    "QuantileFit",
     "RefreshResult",
     "RelatedPrediction",
     "SectorFocus",
@@ -80,6 +92,7 @@ __all__ = [
     "daily_sentiment_index",
     "explain_prediction",
     "fit_logreg_calibration",
+    "fit_quantile_calibration",
     "hit_rate_by_label",
     "hit_rate_by_target_kind",
     "hypothetical_trades",
@@ -90,6 +103,7 @@ __all__ = [
     "predict_sector",
     "predict_stock",
     "resolve_classifier_mode",
+    "resolve_magnitude_mode",
     "retroactive_predict_many",
     "retroactive_predict_stock",
     "rolling_baseline",

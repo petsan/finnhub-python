@@ -29,6 +29,9 @@ classifier's maximum). Two classifier modes are supported:
   any "Why this Call?" explanation in either mode for the full list
   of caveats. See §5.7 below for how to switch.
 
+An optional **magnitude band** (10th–90th-percentile return) can be
+layered on top of either classifier; see §5.8.
+
 **This is not investment advice.** The dashboard is a market-mood gauge
 that you can train against its own historical hit-rate. Predictions are
 informational; the UI never places trades and there is no broker
@@ -329,7 +332,69 @@ env value. The mode falls back to `rule` silently when no calibration
 is fitted, so you can set the env var on a fresh deploy without
 breaking anything.
 
-### 5.8 Switching the sentiment scorer
+### 5.8 Magnitude bands — predicting *how much* the market is going to move
+
+The directional Call (UP/DOWN/FLAT) is what this app does well. If you
+also want a sense of **how big** the next-bar move might be — a return
+band, not a point estimate — there's an opt-in magnitude mode.
+
+```bash
+# After you've accumulated ≥15 closed predictions:
+python -m finn_predictor.cli fit-magnitude
+# → prints fit JSON; persists to the DB
+
+export FINN_PREDICTOR_MAGNITUDE=quantile
+# Restart the service.
+```
+
+Once active, every market / sector / stock prediction also writes
+three numbers: the 10th / 50th / 90th percentile of realised
+next-bar return, conditional on today's sentiment index. The Today
+tab surfaces them as:
+
+> **Expected next-bar move (10th–90th pctile):** −0.80% to +1.20% (median +0.20%)
+
+Read the band as: "if you ran this prediction many times under the
+same sentiment conditions, 80% of the realised moves would fall in
+this range." It is not a target, not a probability, and not a
+guarantee — see *§ Why the band is honest about being wide* below.
+
+The band is fitted by **pinball-loss quantile regression** on the
+historical (sentiment, realised_return) pairs already in the DB —
+same data the classifier uses, different objective. Re-fit at any
+time with `cli fit-magnitude`; the new calibration overrides the
+old. Re-running ingestion without re-fitting reuses the existing
+calibration, so the band stays consistent until you explicitly
+update it.
+
+Flipping `FINN_PREDICTOR_MAGNITUDE=off` (or unsetting it) stops
+writing new bands. Previously-written bands stay on the row — they're
+not erased.
+
+#### Why the band is honest about being wide
+
+Sentiment alone explains a single-digit fraction of next-day return
+variance. A model that returned a single number (say "expected:
++0.4 %") would imply precision the data can't support. The band
+shows the truth: the 80 % interval is genuinely several percent
+wide on most days. Use it for **range awareness**, not point
+forecasting.
+
+A few caveats specific to this mode:
+
+* **Same scorer caveats.** The band is conditioned on the same
+  `sentiment_index` the classifier uses, so it inherits VADER's /
+  FinBERT's limitations.
+* **Same data caveat.** Magnitude predictions for a target with no
+  closed-outcome history don't exist; the band columns stay null
+  until `fit-magnitude` has data to chew on.
+* **The bands can cross on small samples.** The `MagnitudeForecast`
+  dataclass silently reorders any crossed band to a valid one
+  (p10 ≤ p50 ≤ p90), so the UI never shows a band whose lower edge
+  sits above its upper edge. This is a sign the calibration is
+  underfit — accumulate more closed outcomes and re-fit.
+
+### 5.9 Switching the sentiment scorer
 
 VADER is the default. To switch to FinBERT (better at finance
 jargon, ~440 MB of model weights):

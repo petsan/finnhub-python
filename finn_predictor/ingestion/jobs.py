@@ -27,6 +27,10 @@ from finn_predictor.predictor.classifier import (
     load_calibration,
     resolve_classifier_mode,
 )
+from finn_predictor.predictor.magnitude import (
+    load_calibration as load_magnitude_calibration,
+    resolve_magnitude_mode,
+)
 from finn_predictor.predictor.market import predict_market
 from finn_predictor.predictor.sectors import predict_all_sectors
 from finn_predictor.predictor.stocks import predict_all_stocks
@@ -205,6 +209,14 @@ def run_daily_ingest(
     if resolve_classifier_mode() == "logreg":
         calibration = load_calibration(session)
     learned_kwargs["calibration"] = calibration
+
+    # Magnitude band: same opt-in pattern (env + fitted calibration).
+    # Predictors store the three quantiles on the row when the
+    # calibration is present, and leave the columns null otherwise.
+    magnitude_calibration = None
+    if resolve_magnitude_mode() == "quantile":
+        magnitude_calibration = load_magnitude_calibration(session)
+    learned_kwargs["magnitude_calibration"] = magnitude_calibration
 
     market_pred = predict_market(
         session, scorer=scorer, on_date=today, symbol=market_symbol,

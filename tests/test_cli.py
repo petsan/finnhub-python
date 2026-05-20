@@ -261,6 +261,68 @@ def test_fit_classifier_subcommand_success(tmp_path, monkeypatch, capsys) -> Non
     assert payload["model_version"] == mv
 
 
+def test_fit_magnitude_subcommand_needs_data(capsys, tmp_path, monkeypatch) -> None:
+    """Empty DB → rc=3 + 'need at least' message."""
+    monkeypatch.setenv("FINNHUB_API_KEY", "stub")
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db")
+    rc = main(["fit-magnitude"])
+    err = capsys.readouterr().err
+    assert rc == 3
+    assert "need at least" in err.lower()
+
+
+def test_fit_magnitude_subcommand_success(tmp_path, monkeypatch, capsys) -> None:
+    """With seeded outcomes, fit-magnitude prints fit JSON and rc=0."""
+    import random
+
+    db_url = f"sqlite:///{tmp_path}/f.db"
+    monkeypatch.setenv("FINNHUB_API_KEY", "stub")
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", db_url)
+
+    from finn_predictor.sentiment.vader import VaderScorer
+    from finn_predictor.storage import create_engine_and_session, init_db
+    from finn_predictor.storage.models import Prediction, PredictionOutcome
+    from finn_predictor.storage.repo import save_outcome, save_prediction
+
+    mv = VaderScorer().model_version
+    engine, SL = create_engine_and_session(db_url)
+    init_db(engine)
+    base = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    random.seed(7)
+    with SL() as s:
+        for i in range(40):
+            sentiment = random.uniform(-0.8, 0.8)
+            realised = 0.01 * sentiment + random.gauss(0.0, 0.015)
+            p = save_prediction(
+                s,
+                Prediction(
+                    target_symbol="^GSPC",
+                    prediction_date=base + timedelta(days=i),
+                    label="UP" if sentiment > 0 else "DOWN",
+                    confidence=0.5,
+                    sentiment_index=sentiment,
+                    article_count=5,
+                    model_version=mv,
+                ),
+            )
+            save_outcome(
+                s,
+                PredictionOutcome(
+                    prediction_id=p.id, realised_return=realised, hit=True
+                ),
+            )
+    engine.dispose()
+
+    rc = main(["fit-magnitude"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["n_samples"] == 40
+    assert payload["model_version"] == mv
+    taus = [f["tau"] for f in payload["fits"]]
+    assert taus == [0.10, 0.50, 0.90]
+
+
 def test_unknown_subcommand_returns_2(capsys, tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FINNHUB_API_KEY", "stub")
     monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db")

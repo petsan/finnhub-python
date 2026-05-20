@@ -27,6 +27,7 @@ from finn_predictor.ui.app import (
     build_hit_rate_by_label_chart,
     build_rolling_hit_chart,
     contribution_chart_data,
+    format_expected_move,
     headlines_from_contributions,
     latest_market_prediction,
     latest_predictions,
@@ -1063,3 +1064,34 @@ def test_api_key_is_never_persisted_to_db(session) -> None:
     for model, attr in cols_to_scan:
         for row in session.query(model).all():
             assert api_key not in (getattr(row, attr) or "")
+
+
+def test_format_expected_move_renders_band() -> None:
+    """All three columns populated → formatted band string."""
+    p = make_prediction(target_symbol="^GSPC", prediction_date=D)
+    p.expected_return_p10 = -0.012
+    p.expected_return_p50 = 0.004
+    p.expected_return_p90 = 0.018
+    out = format_expected_move(p)
+    assert out == "-1.20% to +1.80% (median +0.40%)"
+
+
+def test_format_expected_move_returns_none_when_columns_missing() -> None:
+    """Any null → None (caller hides the row entirely)."""
+    p = make_prediction(target_symbol="^GSPC", prediction_date=D)
+    # All three default to None on the model, so untouched.
+    assert format_expected_move(p) is None
+
+    # Partial population still returns None — we don't render a half-band.
+    p.expected_return_p10 = -0.01
+    p.expected_return_p90 = 0.01
+    assert format_expected_move(p) is None  # p50 missing
+
+
+def test_format_expected_move_handles_negative_band() -> None:
+    """An all-negative band reads correctly."""
+    p = make_prediction(target_symbol="^GSPC", prediction_date=D)
+    p.expected_return_p10 = -0.025
+    p.expected_return_p50 = -0.010
+    p.expected_return_p90 = -0.002
+    assert format_expected_move(p) == "-2.50% to -0.20% (median -1.00%)"

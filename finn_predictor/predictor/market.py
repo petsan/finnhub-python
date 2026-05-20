@@ -30,6 +30,7 @@ from finn_predictor.predictor.classifier import (
     LogisticCalibration,
     apply_logreg_classification,
 )
+from finn_predictor.predictor.magnitude import MagnitudeCalibration
 from finn_predictor.sentiment.base import Scorer
 from finn_predictor.storage.models import Prediction
 from finn_predictor.storage.repo import save_prediction, utc_day_window
@@ -65,6 +66,7 @@ def predict_market(
     half_life_hours: Optional[float] = None,
     source_weights: Optional[dict[str, float]] = None,
     calibration: Optional[LogisticCalibration] = None,
+    magnitude_calibration: Optional[MagnitudeCalibration] = None,
 ) -> Optional[Prediction]:
     """Compute and persist a whole-market prediction for ``on_date``.
 
@@ -142,4 +144,13 @@ def predict_market(
         article_count=today.count,
         model_version=scorer.model_version,
     )
+    # Optional magnitude band. Applied only when a calibration is
+    # supplied (run_daily_ingest loads it when FINN_PREDICTOR_MAGNITUDE
+    # is set). Leaves the columns null otherwise so the UI knows to
+    # hide the expected-move row.
+    if magnitude_calibration is not None:
+        forecast = magnitude_calibration.predict(today.weighted_mean)
+        pred.expected_return_p10 = forecast.p10
+        pred.expected_return_p50 = forecast.p50
+        pred.expected_return_p90 = forecast.p90
     return save_prediction(session, pred)

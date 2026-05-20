@@ -330,6 +330,7 @@ python3 -m venv .venv
 - 2026-05-20 — UI smoke tests via `streamlit.testing.v1.AppTest`: new `tests/test_ui_smoke.py` boots the actual `ui/app.py` script against a per-test SQLite fixture and asserts (a) no exceptions at import/boot, (b) the `Finn-Predictor` title renders, (c) all six tab labels appear (Today / History / Sectors / Performance / Focus / Learning), (d) the bootstrap empty-state copy shows on a fresh DB, (e) the seeded UP prediction surfaces in the Today-tab metrics. Catches import-time regressions and tab-strip drift that the pure-helper tests couldn't. ``app.py`` stays out of `.coveragerc` (AppTest runs the script in its own context, so line coverage isn't captured) but is now exercised by 4 explicit regression tests.
 - 2026-05-20 — Pluggable story clustering: new `storage/clustering.py` with a `Clusterer` Protocol, the existing 8-word-prefix matcher exposed as `PrefixClusterer` (default), and a new `EmbeddingClusterer` that batched-embeds input + candidate headlines and clusters by cosine ≥ 0.7 (`DEFAULT_COSINE_THRESHOLD`). Sentence-transformers is lazy-loaded with the default model `all-MiniLM-L6-v2`; injectable `embed_fn` keeps tests hermetic. Failed embeddings log a WARNING and fall back to the prefix matcher rather than blanking the column. Selection via `FINN_PREDICTOR_CLUSTERER`; the two UI call sites (Today-tab article rows and the explanation block) now route through `resolve_active_clusterer()`.
 - 2026-05-20 — Proxmox LXC deployment script + deployment manual: new `deploy/proxmox/install.sh` provisions an unprivileged Ubuntu 24.04 LXC, installs Python + the app, drops a hardened systemd unit, starts Streamlit. Idempotent re-runs upgrade in place; `--remove` tears down cleanly; SQLite DB lives at `/opt/finn-predictor/data` and survives in-place upgrades. New `deployment-manual.md` documents three deployment paths (Proxmox LXC primary, Docker, bare metal) with reverse-proxy/TLS recipes, backup/restore commands, health-check endpoints, monitoring hooks, and a hardening checklist. `user-manual.md` caught up with §5.7 (calibrated-classifier switching) and §5.8 (scorer switching + mismatch warning) + new troubleshooting entries. `README.md` now leads with a branch-note linking the doc set.
+- 2026-05-20 — Quantile-band magnitude prediction: new `predictor/magnitude.py` fits three pinball-loss quantile regressions (`p10 / p50 / p90`) on `(sentiment_index, realised_return)` pairs from closed outcomes via pure-Python subgradient descent. New `MagnitudeForecast` + `MagnitudeCalibration` dataclasses (with crossed-quantile sort defence); persistence as JSON in a single `app_settings` row (key `magnitude_calibration`); env toggle `FINN_PREDICTOR_MAGNITUDE=quantile` (default `off`); CLI `python -m finn_predictor.cli fit-magnitude` mirroring `fit-classifier`. Three new nullable columns on `Prediction` (`expected_return_p10`, `_p50`, `_p90`) populated only when the env opts in AND a calibration exists — null otherwise. `init_db` runs idempotent `ALTER TABLE ADD COLUMN` to upgrade old DBs in place. UI Today-tab renders an "Expected next-bar move (10th–90th pctile): -0.80% to +1.20% (median +0.20%)" caption under the market metrics when the band is populated, hides entirely otherwise. The `save_prediction` upsert no-ops on null magnitude columns so a re-run without the calibration doesn't erase a band written by a prior run with it.
 
 ---
 
@@ -386,8 +387,8 @@ python3 -m venv .venv
 constituent-cap / scorer-mismatch / UI-smoke follow-up):
 
 ```
-409 passed
-TOTAL  ~2440 stmts at 96% line+branch coverage
+438 passed
+TOTAL  ~2610 stmts at 96% line+branch coverage
 ```
 
 28 further tests landed in the follow-up sprint: 2 constituent-cap

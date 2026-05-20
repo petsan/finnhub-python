@@ -137,6 +137,7 @@ of up to a year.
 | Calibrated classifier | `FINN_PREDICTOR_CLASSIFIER=logreg` plus a fitted calibration replaces the z-score rule with `P(up) = sigmoid(intercept + beta * sentiment_index)`. Fit via `python -m finn_predictor.cli fit-classifier` once enough outcomes have closed; confidence becomes `|2P − 1|`. |
 | Pluggable story clustering | Default 8-word-prefix matcher catches identical-lead reposts; `FINN_PREDICTOR_CLUSTERER=embedding` switches to sentence-transformers cosine clustering (lazy-loaded, ~80 MB on first use, default model `all-MiniLM-L6-v2`). The embedding path catches paraphrased rewrites the prefix matcher misses. Falls back to prefix on embed failure. |
 | Proxmox LXC installer | `deploy/proxmox/install.sh` provisions an unprivileged Ubuntu 24.04 LXC, installs Python + the app, drops a hardened systemd unit, starts Streamlit on port 8501. Idempotent re-runs upgrade in place; `--remove` tears down cleanly. `deployment-manual.md` covers reverse proxy + TLS, backups, monitoring, hardening. |
+| Magnitude band (opt-in) | `FINN_PREDICTOR_MAGNITUDE=quantile` plus a fitted calibration adds a 10th–90th-percentile return band to each prediction. Three new nullable columns on `Prediction`; pinball-loss quantile regression on closed outcomes; fit via `python -m finn_predictor.cli fit-magnitude`. UI Today-tab renders the band as `-0.8% to +1.2% (median +0.2%)`. Honest about uncertainty by design — the band is wide because sentiment-only signal can't claim more. |
 | Postgres support | Set `FINN_PREDICTOR_DB_URL="postgresql+psycopg://..."` — the upserts are dialect-aware. `psycopg[binary]` ships in default requirements. |
 | Structured logging | `FINN_PREDICTOR_LOG_FORMAT=json` switches to one-record-per-line JSON output suitable for log aggregators. |
 | Docker | `docker compose up --build` builds and starts the app on host 8501. Named volume keeps the SQLite DB across `down`. `RESET_DB=1` wipes on next start. `docker compose run --rm app ingest|retrain|reset-db|shell|hash-password` for headless ops. Runs as non-root. |
@@ -171,7 +172,7 @@ Every external HTTP call goes through `FinnhubGateway` (Finnhub) or an
 injectable `history_fn` (yfinance), both mocked in tests — **no test
 makes a real network call**. SQLite-backed tests run against `:memory:`
 per-test, giving fast and isolated coverage. As of the latest commit:
-**409 tests passing at 96% line+branch coverage** across the
+**438 tests passing at 96% line+branch coverage** across the
 `finn_predictor` package.
 
 See `progress.md` for the design doc, `diff.md` for the per-commit

@@ -306,6 +306,17 @@ def save_prediction(session: Session, prediction: Prediction) -> Prediction:
         existing.confidence = prediction.confidence
         existing.sentiment_index = prediction.sentiment_index
         existing.article_count = prediction.article_count
+        # Magnitude columns: only copy over when the caller supplied
+        # them. Leaving the existing values in place when the caller
+        # passes Nones means a re-run without the magnitude calibration
+        # doesn't erase a band that was written during a prior run
+        # with the calibration on.
+        if prediction.expected_return_p10 is not None:
+            existing.expected_return_p10 = prediction.expected_return_p10
+        if prediction.expected_return_p50 is not None:
+            existing.expected_return_p50 = prediction.expected_return_p50
+        if prediction.expected_return_p90 is not None:
+            existing.expected_return_p90 = prediction.expected_return_p90
         session.commit()
         return existing
 

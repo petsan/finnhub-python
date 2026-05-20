@@ -20,6 +20,7 @@ from typing import Iterable, Optional
 from sqlalchemy.orm import Session
 
 from finn_predictor.predictor.classifier import LogisticCalibration
+from finn_predictor.predictor.magnitude import MagnitudeCalibration
 from finn_predictor.predictor.market import predict_market
 from finn_predictor.sentiment.base import Scorer
 from finn_predictor.storage.models import Prediction
@@ -37,6 +38,7 @@ def predict_stock(
     half_life_hours: Optional[float] = None,
     source_weights: Optional[dict[str, float]] = None,
     calibration: Optional[LogisticCalibration] = None,
+    magnitude_calibration: Optional[MagnitudeCalibration] = None,
 ) -> Optional[Prediction]:
     """Compute and persist a per-ticker directional call.
 
@@ -61,6 +63,7 @@ def predict_stock(
         half_life_hours=half_life_hours,
         source_weights=source_weights,
         calibration=calibration,
+        magnitude_calibration=magnitude_calibration,
     )
 
 
@@ -75,6 +78,7 @@ def predict_all_stocks(
     half_life_hours: Optional[float] = None,
     source_weights: Optional[dict[str, float]] = None,
     calibration: Optional[LogisticCalibration] = None,
+    magnitude_calibration: Optional[MagnitudeCalibration] = None,
 ) -> list[Prediction]:
     """Run :func:`predict_stock` across a list of tickers.
 
@@ -92,6 +96,7 @@ def predict_all_stocks(
             half_life_hours=half_life_hours,
             source_weights=source_weights,
             calibration=calibration,
+            magnitude_calibration=magnitude_calibration,
         )
         if pred is not None:
             out.append(pred)

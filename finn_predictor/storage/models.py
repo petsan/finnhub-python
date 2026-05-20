@@ -189,6 +189,16 @@ class Prediction(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
 
+    # Optional magnitude band — populated by the magnitude calibration
+    # (predictor.magnitude) when FINN_PREDICTOR_MAGNITUDE=quantile and
+    # a calibration has been fitted. Null on every row when the band
+    # is off, on a fresh deploy, or on the day a new ticker was added
+    # before its first fit-magnitude run. Stored as raw returns
+    # (e.g. 0.012 = +1.2%) so the UI can format without re-decoding.
+    expected_return_p10: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    expected_return_p50: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    expected_return_p90: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     outcome: Mapped[Optional["PredictionOutcome"]] = relationship(
         back_populates="prediction",
         uselist=False,

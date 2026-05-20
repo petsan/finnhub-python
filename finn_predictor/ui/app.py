@@ -197,6 +197,35 @@ def latest_predictions(session: Session) -> list[Prediction]:
     return out
 
 
+def format_expected_move(pred: Prediction) -> str | None:
+    """Render the magnitude band as ``-1.2% to +1.5% (median +0.4%)``.
+
+    Returns ``None`` when the band hasn't been populated (any of the
+    three columns null) — the caller decides whether to skip rendering
+    the row entirely. Pure / testable; the Streamlit wrapper below is
+    the side-effecting display helper.
+    """
+    p10 = pred.expected_return_p10
+    p50 = pred.expected_return_p50
+    p90 = pred.expected_return_p90
+    if p10 is None or p50 is None or p90 is None:
+        return None
+    return (
+        f"{p10 * 100:+.2f}% to {p90 * 100:+.2f}% "
+        f"(median {p50 * 100:+.2f}%)"
+    )
+
+
+def _render_expected_move(pred: Prediction) -> None:  # pragma: no cover - Streamlit
+    """Side-effecting wrapper: shows the expected-move line if present."""
+    band = format_expected_move(pred)
+    if band is None:
+        return
+    st.caption(
+        f"**Expected next-bar move (10th–90th pctile):** {band}"
+    )
+
+
 def partition_predictions(
     session: Session, preds: Iterable[Prediction]
 ) -> tuple[Prediction | None, list[Prediction], list[Prediction]]:
@@ -1255,6 +1284,13 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                 cols[0].metric("Call", market_pred.label)
                 cols[1].metric("Confidence", f"{market_pred.confidence:.2f}")
                 cols[2].metric("Articles", market_pred.article_count)
+
+                # --- Expected move band -------------------------------
+                # Populated only when FINN_PREDICTOR_MAGNITUDE=quantile
+                # and a calibration has been fitted. Null columns mean
+                # the band is off — render nothing rather than zeros so
+                # the user isn't misled about whether a forecast exists.
+                _render_expected_move(market_pred)
 
             # --- Why this Call? ---------------------------------------
             # The explanation block is scoped to the market + sector

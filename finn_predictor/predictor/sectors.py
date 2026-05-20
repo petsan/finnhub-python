@@ -24,6 +24,7 @@ from finn_predictor.predictor.classifier import (
     LogisticCalibration,
     apply_logreg_classification,
 )
+from finn_predictor.predictor.magnitude import MagnitudeCalibration
 from finn_predictor.predictor.market import (
     MIN_ARTICLES_FOR_CALL,
     MIN_BASELINE_SIGMA,
@@ -101,6 +102,7 @@ def predict_sector(
     source_weights: Optional[dict[str, float]] = None,
     use_market_cap_weights: bool = True,
     calibration: Optional[LogisticCalibration] = None,
+    magnitude_calibration: Optional[MagnitudeCalibration] = None,
 ) -> Optional[Prediction]:
     """Compute and persist a prediction for one sector's ETF on ``on_date``.
 
@@ -191,6 +193,11 @@ def predict_sector(
         article_count=n,
         model_version=scorer.model_version,
     )
+    if magnitude_calibration is not None:
+        forecast = magnitude_calibration.predict(today_summary.weighted_mean)
+        pred.expected_return_p10 = forecast.p10
+        pred.expected_return_p50 = forecast.p50
+        pred.expected_return_p90 = forecast.p90
     return save_prediction(session, pred)
 
 
@@ -224,6 +231,7 @@ def predict_all_sectors(
     source_weights: Optional[dict[str, float]] = None,
     use_market_cap_weights: bool = True,
     calibration: Optional[LogisticCalibration] = None,
+    magnitude_calibration: Optional[MagnitudeCalibration] = None,
 ) -> list[Prediction]:
     """Run :func:`predict_sector` for every persisted sector.
 
@@ -256,6 +264,7 @@ def predict_all_sectors(
             source_weights=source_weights,
             use_market_cap_weights=use_market_cap_weights,
             calibration=calibration,
+            magnitude_calibration=magnitude_calibration,
         )
         if pred is not None:
             out.append(pred)

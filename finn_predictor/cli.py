@@ -102,6 +102,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    fit_mag = sub.add_parser(
+        "fit-magnitude",
+        help=(
+            "Fit the quantile-band magnitude calibration on closed predictions "
+            "and persist it. Active once FINN_PREDICTOR_MAGNITUDE=quantile."
+        ),
+    )
+    fit_mag.add_argument(
+        "--target-symbol", default=None,
+        help=(
+            "Restrict the training set to one target symbol "
+            "(e.g. '^GSPC' or 'AAPL'). Default fits across all."
+        ),
+    )
+
     return p
 
 
@@ -312,6 +327,54 @@ def cmd_fit_classifier(*, target_symbol: str | None) -> int:
     return 0
 
 
+def cmd_fit_magnitude(*, target_symbol: str | None) -> int:
+    """Fit + persist the quantile-band magnitude calibration."""
+    from finn_predictor.predictor.magnitude import (
+        NotEnoughMagnitudeDataError,
+        fit_quantile_calibration,
+        save_calibration,
+    )
+    from finn_predictor.sentiment import resolve_active_scorer
+
+    url = _resolve_db_url()
+    engine, SessionLocal = create_engine_and_session(url)
+    init_db(engine)
+
+    # Same model_version filter as fit-classifier so VADER + FinBERT
+    # predictions never get mixed in one calibration.
+    model_version = resolve_active_scorer().model_version
+
+    with SessionLocal() as session:
+        try:
+            calibration = fit_quantile_calibration(
+                session,
+                model_version=model_version,
+                target_symbol=target_symbol,
+            )
+        except NotEnoughMagnitudeDataError as exc:
+            print(f"fit-magnitude: {exc}", file=sys.stderr)
+            return 3
+        save_calibration(session, calibration)
+
+    print(
+        json.dumps(
+            {
+                "fits": [
+                    {"tau": f.tau, "intercept": f.intercept, "beta": f.beta}
+                    for f in calibration.fits
+                ],
+                "n_samples": calibration.n_samples,
+                "feature_name": calibration.feature_name,
+                "model_version": model_version,
+                "target_symbol": target_symbol,
+            },
+            indent=2,
+            default=str,
+        )
+    )
+    return 0
+
+
 def cmd_serve() -> int:
     """Print the Streamlit launch command; never starts it itself.
 
@@ -350,6 +413,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_ingest()
     if cmd == "fit-classifier":
         return cmd_fit_classifier(target_symbol=args.target_symbol)
+    if cmd == "fit-magnitude":
+        return cmd_fit_magnitude(target_symbol=args.target_symbol)
     parser.print_help(sys.stderr)
     return 2
 
