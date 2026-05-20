@@ -300,3 +300,118 @@ python3 -m venv .venv
 - 2026-05-19 — Task tracking initialised. Code review of `finnhub-python` 2.4.28 completed and catalogued.
 - 2026-05-19 — Tech-stack decisions locked: Streamlit / SQLite+SQLAlchemy / hybrid VADER→FinBERT / APScheduler. Package layout and iteration scopes drafted.
 - 2026-05-19 — Iterations 1 and 2 implemented. 90 tests passing at 99% coverage.
+- 2026-05-19 — Session-only API key sidebar; ingestion now driven from the UI (`9022488`).
+- 2026-05-19 — Triple-layer API token scrubbing after a real `requests.SSLError`-shaped leak (`662415c`).
+- 2026-05-19 — `trust_env=False` on the Finnhub client to bypass an intercepting dev proxy (`a3026dd`).
+- 2026-05-19 — Resilient ingest: per-endpoint failures isolated and surfaced (`c31bd0d`).
+- 2026-05-19 — Headlines render as clickable links with safe-scheme allow-list (`bb09547`).
+- 2026-05-19 — "Why this Call?" 5-paragraph explanation block + |contribution|-sorted headlines with 🟢/🔴 markers (`34254b0`).
+- 2026-05-19 — Ticker → company-name expansion + divergent vertical contribution chart in Altair (`6aac6e0`).
+- 2026-05-19 — Story clustering: each row shows the earliest "first reported" timestamp of its cluster (`b0ca7cb`).
+- 2026-05-19 — One Prediction per (target, UTC day, model); migration collapsed live DB's 7 click-duplicates to 1 (`72c2928`).
+- 2026-05-19 — Per-stock directional predictor + compact UI table (`eee1f26`).
+- 2026-05-19 — Sidebar error wording distinguishes "news 403" from "candles 403, news empty" (`0fb1117`).
+- 2026-05-19 — Historical company-news backfill (chunked) + retroactive per-day predictions (`1f936f4`).
+
+---
+
+## 5. Implementation Status (current)
+
+### 5.1 What landed since the iter-1/iter-2 baseline
+
+| Area | Module(s) | Status |
+|---|---|---|
+| API key handling | `ui/app.py` (sidebar), `config.py`, `ingestion/client.py`, `predictor/explain.py` | ✅ session-only password input; never on disk / DB / logs; triple-layer token scrubbing; `HTTPS_PROXY` bypass |
+| Resilient ingest | `ingestion/jobs.py` | ✅ per-endpoint failures isolated, returned as `counts["failures"]`, surfaced in the sidebar |
+| Per-stock predictor | `predictor/stocks.py` | ✅ z-score classifier scoped to a single ticker's company news; stored as `Prediction(target_symbol=<ticker>)` |
+| Historical backfill | `ingestion/backfill.py`, `predictor/stocks.py` (`retroactive_predict_*`) | ✅ chunked `/company-news` pagination; replay per UTC day to populate baseline + history |
+| Explanation layer | `predictor/explain.py` | ✅ `ArticleContribution` ranking, 5-paragraph Markdown per prediction |
+| UI affordances | `ui/app.py` | ✅ company-name expansion (`storage/symbol_names.py`), divergent Altair chart, story-cluster "first reported" timestamps, headline links, per-stock table |
+| Dedup migration | `storage/repo.migrate_predictions_to_daily` | ✅ idempotent; applied to live DB |
+
+### 5.2 Daily ingest flow (current)
+
+1. User pastes Finnhub key into sidebar; optionally lists company tickers.
+2. Click *Run ingestion now*: `run_ingestion_with_key` builds a short-lived
+   client (`trust_env=False`), routes through `FinnhubGateway`.
+3. `run_daily_ingest` calls in order, isolating per-op failures:
+   - `general_news("general")` → `news_articles` (category=general, symbol=None)
+   - `stock_candles("^GSPC", ...)` → `price_bars`
+   - `ensure_default_sectors` → seeds 11 sector rows (idempotent)
+   - per-sector `stock_candles(<ETF>, ...)` → `price_bars`
+   - for each user-supplied company ticker:
+     `company_news(<ticker>, ...)` → `news_articles` (category=company, symbol=ticker)
+     `stock_candles(<ticker>, ...)` → `price_bars`
+   - `score_pending_articles` → VADER over any unscored article
+   - `predict_market("^GSPC")` → `predictions(target_symbol="^GSPC", prediction_date=midnight_UTC, ...)`
+   - `predict_all_sectors()` (skipped if no sector universe passed)
+   - `predict_all_stocks(<tickers>)` → one prediction per ticker
+4. Sidebar renders red/green/amber + expander based on the failure shape.
+
+### 5.3 Historical backfill flow
+
+1. User lists tickers + lookback days (7–365) in sidebar; clicks *Backfill*.
+2. `run_backfill_with_key` builds a short-lived client (same safety as above).
+3. `backfill_many` per ticker: pages `/company-news` in 30-day chunks; each
+   chunk goes through `ingest_company_news` → `upsert_articles` (dedupes
+   on `finnhub_id`). Per-chunk `IngestionError`s are captured in
+   `BackfillResult.failures` and the run continues.
+4. `score_pending_articles` once across all newly inserted articles.
+5. `retroactive_predict_many` walks each UTC day in the lookback for each
+   ticker and runs `predict_stock` per day. The start-of-UTC-day
+   normalisation + upsert means re-running over the same range produces
+   no duplicates.
+
+### 5.4 Test posture (current)
+
+`pytest --cov` latest run:
+
+```
+213 passed
+TOTAL  960 stmts  15 miss  230 br  12 part   98%
+```
+
+Per-module: every non-UI module ≥ **94%** line+branch coverage; most at
+100%. The Streamlit `main()` is excluded from coverage but its pure
+helpers (24 of them — `recent_headlines`, `prediction_history`,
+`sector_grid`, `partition_predictions`, `stock_predictions_table`,
+`contribution_chart_data`, `build_contribution_chart`,
+`_format_headline_markdown`, `attach_first_seen`,
+`headlines_from_contributions`, `run_ingestion_with_key`,
+`run_backfill_with_key`, and more) are.
+
+**No test makes a real Finnhub call.** Every external HTTP call goes
+through `FinnhubGateway`, which is mocked.
+
+### 5.5 Known limitations (current)
+
+* **No history for general market news.** Finnhub's `/news` paginates
+  forward only — the whole-market `^GSPC` baseline can only build up
+  over wall-clock time.
+* **`/stock/candle` is gated on free-tier keys** (we see 403). All
+  predictions still write fine; only the realised-return validation
+  (`prediction_outcomes`) stays empty.
+* **Day-1 over-confidence.** When a ticker is newly ingested, the
+  rolling baseline σ floors at `MIN_BASELINE_SIGMA = 0.05`. Even modest
+  sentiment can z-score above the threshold; the confidence number can
+  pin at 1.00 on small samples. Backfill mitigates this for stocks by
+  giving the baseline 30+ days of history immediately.
+* **Story clustering is heuristic.** First-8-word prefix matching;
+  fully-rewritten headlines on the same event won't cluster, and
+  shared-lead but distinct stories will. Acceptable trade-off without
+  embeddings.
+* **Classifier is rule-based.** Confidence is normalised z-distance,
+  not probability. FinBERT is wired but not active by default.
+
+### 5.6 Files added on this branch
+
+See `diff.md` for per-commit detail. High level:
+
+* 19 Python files under `finn_predictor/` (5 sub-packages + 2 single
+  modules), ~3 000 LoC.
+* 17 test modules under `tests/` (one per Python module, plus
+  `conftest.py`), 213 tests, ~3 500 LoC.
+* `progress.md`, `summary.md`, `diff.md`, `pytest.ini`, `.coveragerc`.
+* One additive line group in `.gitignore` for the local SQLite file.
+
+The upstream `finnhub-python` library is unchanged.
