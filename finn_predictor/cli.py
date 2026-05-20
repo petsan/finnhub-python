@@ -63,6 +63,30 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Activation override. 'auto' uses the persisted policy.",
     )
 
+    hashp = sub.add_parser(
+        "hash-password",
+        help=(
+            "Print a bcrypt hash suitable for "
+            "FINN_PREDICTOR_PASSWORD_HASH. Reads the password "
+            "from stdin if not given on the command line."
+        ),
+    )
+    hashp.add_argument(
+        "password",
+        nargs="?",
+        default=None,
+        help="The plaintext password. Omit to read from stdin.",
+    )
+
+    sub.add_parser(
+        "ingest",
+        help=(
+            "Run one daily-ingest cycle headlessly. Reads "
+            "FINNHUB_API_KEY from env. Suitable for cron / "
+            "scheduled-task sidecar."
+        ),
+    )
+
     return p
 
 
@@ -123,6 +147,92 @@ def cmd_retrain(*, n_calls: int, activate: str) -> int:
     return 0
 
 
+def cmd_hash_password(plaintext: str | None) -> int:
+    """Print a bcrypt hash for FINN_PREDICTOR_PASSWORD_HASH."""
+    from finn_predictor.security import (
+        MAX_PASSWORD_LEN,
+        MIN_PASSWORD_LEN,
+        hash_password,
+    )
+
+    if plaintext is None:
+        # Read from stdin so the password doesn't show up in shell history.
+        import getpass
+
+        try:
+            plaintext = getpass.getpass("Password: ")
+        except (EOFError, KeyboardInterrupt):
+            print("hash-password: cancelled", file=sys.stderr)
+            return 2
+
+    if not plaintext or len(plaintext) < MIN_PASSWORD_LEN:
+        print(
+            f"hash-password: password must be at least "
+            f"{MIN_PASSWORD_LEN} characters",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        h = hash_password(plaintext)
+    except ValueError as exc:
+        print(f"hash-password: {exc}", file=sys.stderr)
+        return 2
+    print(h)
+    print(
+        "\nSet this as FINN_PREDICTOR_PASSWORD_HASH on the server "
+        "(quote it because the hash contains $):\n"
+        f"  export FINN_PREDICTOR_PASSWORD_HASH='{h}'",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_ingest() -> int:
+    """Run one daily-ingest cycle headlessly."""
+    # Lazy import — keeps CLI import-time cheap for the lighter
+    # subcommands.
+    from finn_predictor.config import load_settings
+    from finn_predictor.ingestion.client import FinnhubGateway, RateLimiter
+    from finn_predictor.ingestion.jobs import run_daily_ingest
+    from finn_predictor.sentiment.vader import VaderScorer
+    from finnhub import Client as FinnhubClient
+
+    try:
+        settings = load_settings()  # requires FINNHUB_API_KEY
+    except RuntimeError as exc:
+        print(f"ingest: {exc}", file=sys.stderr)
+        return 2
+
+    url = _resolve_db_url()
+    engine, SessionLocal = create_engine_and_session(url)
+    init_db(engine)
+
+    client = FinnhubClient(api_key=settings.finnhub_api_key)
+    # Same proxy bypass + close pattern as the UI's run_ingestion_with_key.
+    try:
+        client._session.trust_env = False
+    except AttributeError:  # pragma: no cover
+        pass
+
+    try:
+        gateway = FinnhubGateway(
+            client=client,
+            rate_limiter=RateLimiter(settings.rate_limit_per_minute),
+        )
+        with SessionLocal() as session:
+            counts = run_daily_ingest(
+                session=session,
+                gateway=gateway,
+                scorer=VaderScorer(),
+            )
+    finally:
+        client.close()
+
+    print(json.dumps(counts, indent=2, default=str))
+    return 0
+
+
 def cmd_serve() -> int:
     """Print the Streamlit launch command; never starts it itself.
 
@@ -141,10 +251,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    # Honour FINN_PREDICTOR_LOG_FORMAT / _LOG_LEVEL. The setup_logging
+    # call also attaches the SecretScrubFilter to every handler so log
+    # records can't accidentally leak Finnhub tokens or bcrypt hashes.
+    from finn_predictor.logging_config import setup_logging
+
+    setup_logging(force=True)
 
     cmd = args.command or "serve"
     if cmd == "serve":
@@ -153,6 +265,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_reset_db(yes=bool(args.yes))
     if cmd == "retrain":
         return cmd_retrain(n_calls=int(args.n_calls), activate=args.activate)
+    if cmd == "hash-password":
+        return cmd_hash_password(args.password)
+    if cmd == "ingest":
+        return cmd_ingest()
     parser.print_help(sys.stderr)
     return 2
 

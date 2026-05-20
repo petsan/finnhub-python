@@ -92,6 +92,33 @@ def test_retrain_subcommand_reports_not_enough_data(capsys, tmp_path, monkeypatc
     assert "not enough" in err.lower()
 
 
+def test_hash_password_with_explicit_arg(capsys) -> None:
+    """`cli hash-password <plaintext>` prints a bcrypt hash + a hint."""
+    rc = main(["hash-password", "hunter2-2026"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    # The hash goes to stdout; the export hint to stderr.
+    assert captured.out.strip().startswith("$2")
+    assert "FINN_PREDICTOR_PASSWORD_HASH" in captured.err
+
+
+def test_hash_password_rejects_too_short(capsys) -> None:
+    rc = main(["hash-password", "ab"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "at least" in err.lower()
+
+
+def test_ingest_subcommand_requires_api_key(capsys, tmp_path, monkeypatch) -> None:
+    """`cli ingest` without FINNHUB_API_KEY returns exit 2 with a friendly message."""
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db")
+    rc = main(["ingest"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "FINNHUB_API_KEY" in err
+
+
 def test_unknown_subcommand_returns_2(capsys, tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FINNHUB_API_KEY", "stub")
     monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db")

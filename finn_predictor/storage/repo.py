@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional, Sequence
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
@@ -25,6 +26,28 @@ from finn_predictor.storage.models import (
 def _utcnow() -> datetime:
     """UTC-aware now() — duplicated from models.py so callers don't import a private helper."""
     return datetime.now(timezone.utc)
+
+
+def _dialect_insert(session: Session):
+    """Return the right INSERT builder for the session's bound dialect.
+
+    SQLAlchemy's ``dialects.sqlite.insert`` and
+    ``dialects.postgresql.insert`` both expose ``on_conflict_do_nothing``
+    but live in separate modules. Picking at runtime lets the same
+    repository functions work against either store without changing
+    call sites — set ``FINN_PREDICTOR_DB_URL=postgresql://...`` and
+    everything else just works.
+    """
+    bind = session.get_bind()
+    name = getattr(getattr(bind, "dialect", None), "name", "sqlite")
+    if name == "postgresql":
+        return postgres_insert
+    # SQLite is the historical default; anything else falls back to the
+    # SQLite builder (works on most file-backed SQL dialects with the
+    # same syntax). This isn't strict — callers that point at MySQL
+    # or another dialect that doesn't support ON CONFLICT DO NOTHING
+    # will hit a clear error from the DB driver.
+    return sqlite_insert
 
 
 # Default sector universe used by iteration 2. The codes mirror the Sector
@@ -54,12 +77,13 @@ def upsert_articles(session: Session, articles: Iterable[NewsArticle]) -> int:
     DO NOTHING`` to keep this idempotent under retried ingestion runs.
     """
     inserted = 0
+    insert_builder = _dialect_insert(session)
     for art in articles:
         # Core-level inserts don't fire SQLAlchemy column defaults; fall back
         # to a wall-clock timestamp if the caller didn't set one explicitly.
         ingested_at = art.ingested_at or _utcnow()
         stmt = (
-            sqlite_insert(NewsArticle)
+            insert_builder(NewsArticle)
             .values(
                 finnhub_id=art.finnhub_id,
                 category=art.category,
@@ -141,9 +165,10 @@ def save_scores(session: Session, scores: Iterable[SentimentScore]) -> int:
 def upsert_price_bars(session: Session, bars: Iterable[PriceBar]) -> int:
     """Insert daily price bars, skipping ``(symbol, trade_date)`` duplicates."""
     inserted = 0
+    insert_builder = _dialect_insert(session)
     for bar in bars:
         stmt = (
-            sqlite_insert(PriceBar)
+            insert_builder(PriceBar)
             .values(
                 symbol=bar.symbol,
                 trade_date=bar.trade_date,

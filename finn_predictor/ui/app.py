@@ -25,6 +25,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from finn_predictor.config import load_settings
+from finn_predictor.security import (
+    auth_enabled,
+    current_password_hash,
+    verify_password,
+)
 from finn_predictor.ingestion.backfill import BackfillResult, backfill_many
 from finn_predictor.ingestion.client import (
     FinnhubGateway,
@@ -108,6 +113,49 @@ from finn_predictor.storage.symbol_names import expand_symbol, expand_symbol_sho
 
 
 API_KEY_SESSION_KEY = "finnhub_api_key"
+AUTHED_SESSION_KEY = "_finn_authenticated"
+
+
+def _enforce_auth_gate() -> bool:  # pragma: no cover - Streamlit UI
+    """Show a password prompt until the session is authenticated.
+
+    Returns True iff the rest of the page should render. When auth is
+    disabled (no ``FINN_PREDICTOR_PASSWORD_HASH`` env var) this is a
+    no-op that returns True immediately — preserves the default
+    localhost-dev experience.
+    """
+    if not auth_enabled():
+        return True
+    if st.session_state.get(AUTHED_SESSION_KEY):
+        return True
+
+    st.set_page_config(page_title="Finn-Predictor — locked")
+    st.title("🔒 Finn-Predictor")
+    st.caption(
+        "This instance has a password gate enabled "
+        "(`FINN_PREDICTOR_PASSWORD_HASH` is set)."
+    )
+    pw = st.text_input(
+        "Password",
+        type="password",
+        key="_finn_password_prompt",
+        placeholder="enter the deploy password",
+    )
+    if st.button("Unlock", type="primary", disabled=not pw):
+        if verify_password(pw, current_password_hash()):
+            st.session_state[AUTHED_SESSION_KEY] = True
+            # Discard the typed password from session_state so it
+            # doesn't sit in memory between reruns.
+            st.session_state.pop("_finn_password_prompt", None)
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    st.caption(
+        "Forgot the password? Stop the server, unset "
+        "`FINN_PREDICTOR_PASSWORD_HASH` (or set a new one with "
+        "`python -m finn_predictor.cli hash-password`), and restart."
+    )
+    return False
 
 
 # -- Data helpers (pure, testable) ----------------------------------------
@@ -1008,6 +1056,11 @@ def _parse_symbols(csv: str) -> list[str]:
 
 
 def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
+    # Auth gate first — locks the page until the env-var password
+    # matches. No-op when FINN_PREDICTOR_PASSWORD_HASH is unset.
+    if not _enforce_auth_gate():
+        return
+
     st.set_page_config(page_title="Finn-Predictor", layout="wide")
 
     # UI must boot even without a key — load_settings(require_api_key=False)

@@ -49,6 +49,14 @@ VOLUME ["/data"]
 COPY docker/entrypoint.sh /usr/local/bin/finn-entrypoint
 RUN chmod +x /usr/local/bin/finn-entrypoint
 
+# Run as an unprivileged user. UID 1001 is a common choice that doesn't
+# collide with most host users — and `--system` means we get a homeless
+# account that can't log in. /data and /app are owned by finn so the
+# app can write the SQLite file + scratch files but nothing else.
+RUN useradd --system --uid 1001 --no-create-home --shell /sbin/nologin finn \
+ && chown -R finn:finn /app /data
+USER finn
+
 EXPOSE 8501
 
 # Streamlit health-check Docker can use for `depends_on: service_healthy`.

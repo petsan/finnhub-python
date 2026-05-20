@@ -218,11 +218,47 @@ mapping from the default localhost-only binding.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `FINNHUB_API_KEY` | unset | Only required for CLI tools (`retrain`). UI accepts the key in-session. |
-| `FINN_PREDICTOR_DB_URL` | `sqlite:///finn_predictor.db` (local), `sqlite:////data/finn_predictor.db` (Docker) | SQLAlchemy URL. Point at PostgreSQL if you want — the schema works with both. |
+| `FINNHUB_API_KEY` | unset | Required for the CLI tools `retrain` and `ingest`. UI accepts the key in-session, so unset is fine for UI-only deployments. |
+| `FINN_PREDICTOR_DB_URL` | `sqlite:///finn_predictor.db` (local), `sqlite:////data/finn_predictor.db` (Docker) | SQLAlchemy URL. Set to `postgresql+psycopg://user:pw@host/db` to use Postgres — the upserts are dialect-aware. |
 | `FINN_PREDICTOR_TIMEOUT` | `15` | Per-request HTTP timeout in seconds. |
 | `FINN_PREDICTOR_RATE_LIMIT` | `55` | Finnhub calls per minute (free tier is ~60). |
+| `FINN_PREDICTOR_PASSWORD_HASH` | unset | When set to a bcrypt hash, the UI gates every render behind a password prompt until the right plaintext is supplied. Unset = no auth (safe default for localhost dev). Generate with `python -m finn_predictor.cli hash-password`. |
+| `FINN_PREDICTOR_LOG_FORMAT` | `text` | `text` for human stdout, `json` for one-record-per-line structured output suitable for log aggregators. |
+| `FINN_PREDICTOR_LOG_LEVEL` | `INFO` | Standard `logging` level name. |
 | `RESET_DB` | `0` | Docker only. Set to `1` (or `true`) to wipe the DB on container start. |
+
+### 4.1.1 Enabling the UI password gate
+
+```bash
+# generate a hash (prompts for password on stdin so it doesn't end up
+# in shell history)
+$ python -m finn_predictor.cli hash-password
+Password: ********
+$2b$12$abc...verylongbcrypthash
+
+# stash it in the environment
+$ export FINN_PREDICTOR_PASSWORD_HASH='$2b$12$abc...verylongbcrypthash'
+
+# or in docker-compose.yml, add under `environment:`:
+#   FINN_PREDICTOR_PASSWORD_HASH: "$2b$12$abc...verylongbcrypthash"
+```
+
+The plaintext is never stored anywhere — only the hash. Wiping the
+SQLite volume does NOT lock you out, because the auth state lives in
+the env var, not the DB.
+
+### 4.1.2 PostgreSQL
+
+```bash
+export FINN_PREDICTOR_DB_URL="postgresql+psycopg://finn:secret@db.example.com:5432/finn_predictor"
+```
+
+`psycopg[binary]` ships with the default `requirements.txt`. The
+SQLAlchemy upserts (article dedupe, price-bar dedupe) automatically
+switch to the Postgres `ON CONFLICT DO NOTHING` builder when the
+dialect is detected at runtime. Schema migrations are still
+idempotent `Base.metadata.create_all(engine)` — for production you
+probably want Alembic on top of this, but the basics work.
 
 ### 4.2 Settings stored in the DB
 
@@ -268,6 +304,16 @@ python -m finn_predictor.cli retrain --n-calls 30
 python -m finn_predictor.cli retrain --activate auto     # default
 python -m finn_predictor.cli retrain --activate yes      # force-activate
 python -m finn_predictor.cli retrain --activate no       # save inactive
+
+# Generate a bcrypt hash for FINN_PREDICTOR_PASSWORD_HASH.
+# Prompts on stdin if you omit the argument (recommended — keeps the
+# plaintext out of shell history).
+python -m finn_predictor.cli hash-password
+python -m finn_predictor.cli hash-password 'my plaintext'
+
+# Run one daily-ingest cycle headlessly. Reads FINNHUB_API_KEY from
+# env. Suitable for cron / scheduled-task sidecar.
+FINNHUB_API_KEY=... python -m finn_predictor.cli ingest
 ```
 
 Exit codes:
@@ -275,8 +321,25 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | `0` | OK |
-| `2` | Argparse error, or `reset-db` invoked without `--yes` |
+| `2` | Argparse error, missing arg (`reset-db` without `--yes`, `ingest` without `FINNHUB_API_KEY`, `hash-password` with too-short input) |
 | `3` | `retrain` couldn't run (fewer than 10 closed predictions) |
+
+### 5.1 Scheduled ingestion via cron
+
+The Streamlit process can't reliably run a background scheduler — it
+only fires while the page is open. For unattended deployment, use host
+cron + the `ingest` subcommand:
+
+```cron
+# crontab -e, then add:
+#   M H DoM Mon DoW
+30 21 * * 1-5  FINNHUB_API_KEY=... docker compose -f /path/to/finn/docker-compose.yml run --rm app ingest >> /var/log/finn-ingest.log 2>&1
+```
+
+21:30 UTC weekdays = ~30 min after the NYSE close. Adjust as needed.
+Each `ingest` run reuses the same `finn_data` volume, so predictions
+accumulate. Pair with a separate weekly `retrain` line if you want
+auto-improvement.
 
 ---
 

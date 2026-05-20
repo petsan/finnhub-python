@@ -30,3 +30,9 @@ yfinance>=0.2
 
 # --- Self-improvement (Bayesian optimisation of learned weights) ---
 scikit-optimize>=0.10
+
+# --- Auth gate (FINN_PREDICTOR_PASSWORD_HASH) ---
+bcrypt>=4.0
+
+# --- Optional: Postgres driver. Comment out if you only use SQLite. ---
+psycopg[binary]>=3.1

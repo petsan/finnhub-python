@@ -202,6 +202,28 @@ def test_migrate_predictions_keeps_separate_target_symbols(session) -> None:
     assert len(predictions_for(session, "XLE")) == 1
 
 
+def test_dialect_insert_picks_sqlite_by_default(session) -> None:
+    """The helper returns the SQLite insert builder for our test session."""
+    from finn_predictor.storage.repo import _dialect_insert
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    assert _dialect_insert(session) is sqlite_insert
+
+
+def test_dialect_insert_picks_postgres_when_dialect_is_postgresql() -> None:
+    """When the session is bound to a postgresql engine, use postgres_insert."""
+    from sqlalchemy.dialects.postgresql import insert as postgres_insert
+    from finn_predictor.storage.repo import _dialect_insert
+    from unittest.mock import MagicMock
+
+    fake_session = MagicMock()
+    fake_dialect = MagicMock()
+    fake_dialect.name = "postgresql"
+    fake_session.get_bind.return_value.dialect = fake_dialect
+
+    assert _dialect_insert(fake_session) is postgres_insert
+
+
 def test_app_settings_get_set_roundtrip(session) -> None:
     from finn_predictor.storage.repo import (
         get_setting, set_setting,
