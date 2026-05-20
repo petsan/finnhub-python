@@ -30,6 +30,11 @@ from finn_predictor.ingestion.client import (
     scrub_token,
 )
 from finn_predictor.ingestion.jobs import run_daily_ingest
+from finn_predictor.predictor.explain import (
+    ArticleContribution,
+    article_contributions,
+    explain_prediction,
+)
 from finn_predictor.sentiment.vader import VaderScorer
 from finn_predictor.storage import create_engine_and_session, init_db
 from finn_predictor.storage.models import (
@@ -57,6 +62,54 @@ def latest_market_prediction(session: Session, symbol: str = "^GSPC") -> Predict
         .limit(1)
     )
     return session.scalars(stmt).first()
+
+
+def latest_predictions(session: Session) -> list[Prediction]:
+    """One latest Prediction per target_symbol — across market + every sector.
+
+    Sorted with ``^GSPC`` first (the headline call) then alphabetical by
+    target symbol. Returns an empty list when no predictions exist.
+    """
+    distinct_symbols = session.scalars(
+        select(Prediction.target_symbol).distinct()
+    ).all()
+    out: list[Prediction] = []
+    for sym in distinct_symbols:
+        latest = session.scalar(
+            select(Prediction)
+            .where(Prediction.target_symbol == sym)
+            .order_by(Prediction.prediction_date.desc())
+            .limit(1)
+        )
+        if latest is not None:
+            out.append(latest)
+    # Market call first, then sectors alphabetically.
+    out.sort(key=lambda p: (p.target_symbol != "^GSPC", p.target_symbol))
+    return out
+
+
+def headlines_from_contributions(
+    contributions: Iterable[ArticleContribution],
+    *,
+    limit: int = 10,
+) -> list[dict]:
+    """Convert contribution objects to UI-row dicts (top ``limit`` by |contribution|)."""
+    rows: list[dict] = []
+    for c in list(contributions)[:limit]:
+        a = c.article
+        rows.append(
+            {
+                "published_at": a.published_at,
+                "headline": a.headline,
+                "source": a.source,
+                "symbol": a.symbol or "*",
+                "url": a.url or "",
+                "sentiment": c.score,
+                "contribution": c.contribution,
+                "supports_call": c.supports_call,
+            }
+        )
+    return rows
 
 
 def recent_headlines(
@@ -158,11 +211,25 @@ def _escape_markdown(text: str) -> str:
 
 
 def _format_headline_markdown(row: dict) -> str:
-    """One Markdown line per headline; clickable if the URL is present."""
+    """One Markdown line per headline; clickable if the URL is present.
+
+    When the row carries a ``contribution`` field (set by
+    :func:`headlines_from_contributions`), the line also shows that signed
+    number and a leading dot indicating whether the article supported the
+    Call (🟢) or opposed it (🔴). When neither field is present we render
+    the legacy headline-only layout.
+    """
     headline = _escape_markdown(str(row.get("headline") or "").strip()) or "(no title)"
     url = (row.get("url") or "").strip()
     # Only link when the URL looks remotely usable. Anything else is plain text.
     title_md = f"[{headline}]({url})" if url.startswith(("http://", "https://")) else f"**{headline}**"
+
+    marker = ""
+    supports = row.get("supports_call")
+    if supports is True:
+        marker = "🟢 "
+    elif supports is False:
+        marker = "🔴 "
 
     bits = [title_md]
     source = (row.get("source") or "").strip()
@@ -180,7 +247,10 @@ def _format_headline_markdown(row: dict) -> str:
         bits.append(f"sentiment {sentiment:+.2f}")
     else:
         bits.append("sentiment —")
-    return " · ".join(bits)
+    contribution = row.get("contribution")
+    if isinstance(contribution, (int, float)) and contribution == contribution:
+        bits.append(f"contrib {contribution:+.3f}")
+    return marker + " · ".join(bits)
 
 
 def sector_grid(session: Session, sectors: Iterable[Sector]) -> pd.DataFrame:
@@ -372,29 +442,66 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
         )
 
         with tab_today:
-            pred = latest_market_prediction(session)
-            if pred is None:
-                st.info("No predictions yet. Paste an API key in the sidebar and click *Run ingestion now*.")
+            preds = latest_predictions(session)
+            market_pred = next(
+                (p for p in preds if p.target_symbol == "^GSPC"), None
+            )
+
+            if market_pred is None:
+                st.info(
+                    "No predictions yet. Paste an API key in the sidebar and "
+                    "click *Run ingestion now*."
+                )
             else:
                 cols = st.columns(3)
-                cols[0].metric("Call", pred.label)
-                cols[1].metric("Confidence", f"{pred.confidence:.2f}")
-                cols[2].metric("Articles", pred.article_count)
+                cols[0].metric("Call", market_pred.label)
+                cols[1].metric("Confidence", f"{market_pred.confidence:.2f}")
+                cols[2].metric("Articles", market_pred.article_count)
 
-            st.subheader("Recent headlines")
-            # VaderScorer().model_version is the version that the ingestion
-            # job stamped onto every score row in iter 1.
-            from finn_predictor.sentiment.vader import VaderScorer  # local import keeps cold path cheap
-
-            headlines = recent_headlines(
-                session, limit=10, model_version=VaderScorer().model_version
-            )
-            if headlines:
-                for row in headlines:
-                    st.markdown(
-                        "- " + _format_headline_markdown(row),
-                        unsafe_allow_html=False,
+            # --- Why this Call? ---------------------------------------
+            if preds:
+                if len(preds) == 1:
+                    st.subheader("Why this Call?")
+                else:
+                    st.subheader(
+                        f"Why these {len(preds)} Calls? "
+                        f"({len(preds) - 1} sector(s) plus the market)"
                     )
+
+                # Fixed-height container makes the explanation scrollable
+                # when the per-prediction text gets long.
+                with st.container(height=480):
+                    for i, p in enumerate(preds):
+                        st.markdown(
+                            f"### `{p.target_symbol}` — **{p.label}** "
+                            f"(confidence {p.confidence:.2f}, "
+                            f"{p.article_count} article(s))"
+                        )
+                        st.markdown(explain_prediction(session, prediction=p))
+                        if i < len(preds) - 1:
+                            st.divider()
+
+            # --- Recent headlines (sorted by contribution to the market call) ---
+            st.subheader("Recent headlines")
+            if market_pred is not None:
+                contribs = article_contributions(session, prediction=market_pred)
+                if contribs:
+                    st.caption(
+                        "Sorted by signed contribution to the Call. "
+                        "🟢 = supports the Call, 🔴 = opposes."
+                    )
+                    rows = headlines_from_contributions(contribs, limit=10)
+                else:
+                    # Prediction exists but no scored articles — fall back to recency.
+                    rows = recent_headlines(
+                        session, limit=10, model_version=market_pred.model_version
+                    )
+            else:
+                rows = recent_headlines(session, limit=10)
+
+            if rows:
+                for row in rows:
+                    st.markdown("- " + _format_headline_markdown(row))
             else:
                 st.write("No headlines yet.")
 

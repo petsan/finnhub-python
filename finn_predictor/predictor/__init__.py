@@ -11,14 +11,22 @@ from finn_predictor.predictor.aggregate import (
     daily_sentiment_index,
     rolling_baseline,
 )
+from finn_predictor.predictor.explain import (
+    ArticleContribution,
+    article_contributions,
+    explain_prediction,
+)
 from finn_predictor.predictor.market import classify, predict_market
 from finn_predictor.predictor.sectors import predict_all_sectors, predict_sector
 
 __all__ = [
+    "ArticleContribution",
     "SentimentSummary",
     "aggregate_sentiment",
+    "article_contributions",
     "classify",
     "daily_sentiment_index",
+    "explain_prediction",
     "predict_all_sectors",
     "predict_market",
     "predict_sector",

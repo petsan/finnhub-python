@@ -14,11 +14,14 @@ from finn_predictor.storage.repo import (
     save_scores,
     upsert_articles,
 )
+from finn_predictor.predictor.explain import ArticleContribution
 from finn_predictor.ui.app import (
     _escape_markdown,
     _format_headline_markdown,
     _parse_symbols,
+    headlines_from_contributions,
     latest_market_prediction,
+    latest_predictions,
     prediction_history,
     recent_headlines,
     run_ingestion_with_key,
@@ -136,6 +139,92 @@ def test_sector_grid_one_row_per_sector(session) -> None:
     assert energy["label"] == "—"
 
 
+# ---------------- latest_predictions & headlines_from_contributions ----------------
+
+
+def test_latest_predictions_one_per_target_symbol_market_first(session) -> None:
+    """Multiple targets across days; we expect one row per symbol, ^GSPC first."""
+    save_prediction(
+        session,
+        make_prediction(
+            target_symbol="XLK", prediction_date=D - timedelta(days=2), label="UP"
+        ),
+    )
+    save_prediction(
+        session,
+        make_prediction(
+            target_symbol="XLK", prediction_date=D, label="DOWN"
+        ),
+    )
+    save_prediction(
+        session,
+        make_prediction(
+            target_symbol="^GSPC", prediction_date=D - timedelta(days=1), label="UP"
+        ),
+    )
+    save_prediction(
+        session,
+        make_prediction(
+            target_symbol="XLE", prediction_date=D, label="FLAT"
+        ),
+    )
+
+    rows = latest_predictions(session)
+    syms = [r.target_symbol for r in rows]
+    # ^GSPC first, then sectors alphabetically.
+    assert syms == ["^GSPC", "XLE", "XLK"]
+    # Each target's *latest* row is returned.
+    assert {r.target_symbol: r.label for r in rows}["XLK"] == "DOWN"
+
+
+def test_latest_predictions_empty(session) -> None:
+    assert latest_predictions(session) == []
+
+
+def test_headlines_from_contributions_preserves_order_and_fields(session) -> None:
+    a1 = make_article(finnhub_id=1, headline="A", url="https://x/a", published_at=D)
+    a2 = make_article(finnhub_id=2, headline="B", url="", published_at=D)
+    from finn_predictor.storage.repo import upsert_articles
+    upsert_articles(session, [a1, a2])
+    persisted = session.query(type(a1)).order_by(type(a1).finnhub_id).all()
+
+    contribs = [
+        ArticleContribution(
+            article=persisted[0], score=0.8, weight=1.0,
+            contribution=0.6, supports_call=True,
+        ),
+        ArticleContribution(
+            article=persisted[1], score=-0.4, weight=1.0,
+            contribution=-0.3, supports_call=False,
+        ),
+    ]
+    rows = headlines_from_contributions(contribs, limit=10)
+    assert [r["headline"] for r in rows] == ["A", "B"]
+    assert rows[0]["contribution"] == pytest.approx(0.6)
+    assert rows[0]["supports_call"] is True
+    assert rows[0]["url"] == "https://x/a"
+    assert rows[1]["url"] == ""
+
+
+def test_headlines_from_contributions_respects_limit(session) -> None:
+    arts = [
+        make_article(finnhub_id=i, headline=f"hl-{i}", published_at=D)
+        for i in range(20)
+    ]
+    from finn_predictor.storage.repo import upsert_articles
+    upsert_articles(session, arts)
+    persisted = session.query(type(arts[0])).all()
+    contribs = [
+        ArticleContribution(
+            article=a, score=0.5, weight=1.0,
+            contribution=0.5 / 20, supports_call=True,
+        )
+        for a in persisted
+    ]
+    rows = headlines_from_contributions(contribs, limit=5)
+    assert len(rows) == 5
+
+
 # ---------------- headline markdown formatting ----------------
 
 
@@ -204,6 +293,42 @@ def test_format_headline_markdown_escapes_brackets_in_headline() -> None:
     # Bracketed text must be escaped so the Markdown parser doesn't
     # interpret it as an inline link.
     assert "[Stocks \\[really\\] surge](https://x.example/y)" in line
+
+
+def test_format_headline_markdown_supports_call_marker() -> None:
+    """🟢 when the article supports the Call, 🔴 when it opposes."""
+    base = {
+        "headline": "h",
+        "url": "https://x/y",
+        "source": "",
+        "symbol": "*",
+        "published_at": None,
+        "sentiment": 0.5,
+        "contribution": 0.123,
+    }
+    pro = _format_headline_markdown({**base, "supports_call": True})
+    con = _format_headline_markdown({**base, "supports_call": False})
+    assert pro.startswith("🟢 ")
+    assert con.startswith("🔴 ")
+    # Contribution shows in both, signed to 3dp.
+    assert "contrib +0.123" in pro
+    assert "contrib +0.123" in con
+
+
+def test_format_headline_markdown_omits_marker_when_supports_unknown() -> None:
+    """Legacy rows (no supports_call/contribution) render without markers."""
+    line = _format_headline_markdown(
+        {
+            "headline": "h",
+            "url": "https://x/y",
+            "source": "",
+            "symbol": "*",
+            "published_at": None,
+            "sentiment": 0.5,
+        }
+    )
+    assert not line.startswith("🟢") and not line.startswith("🔴")
+    assert "contrib" not in line
 
 
 def test_format_headline_markdown_handles_empty_headline() -> None:
