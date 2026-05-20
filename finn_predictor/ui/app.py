@@ -185,6 +185,14 @@ def run_ingestion_with_key(
         raise ValueError("api_key must be a non-empty string")
 
     client = FinnhubClient(api_key=api_key)
+    # Bypass HTTPS_PROXY / HTTP_PROXY env vars so an intercepting dev proxy
+    # (Burp, mitmproxy, Charles, ...) doesn't break TLS verification.
+    # The proxy serves its own self-signed cert which certifi rejects.
+    # The user opted into this behaviour explicitly during deploy setup.
+    try:
+        client._session.trust_env = False
+    except AttributeError:  # pragma: no cover - upstream session always exists today
+        pass
     try:
         gateway = FinnhubGateway(
             client=client,

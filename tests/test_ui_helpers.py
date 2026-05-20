@@ -177,6 +177,29 @@ def test_run_ingestion_with_key_closes_client_on_exception(session) -> None:
         client_instance.close.assert_called_once_with()
 
 
+def test_run_ingestion_with_key_disables_env_proxy_trust(session) -> None:
+    """Per deployment decision: bypass HTTPS_PROXY so an intercepting dev
+    proxy doesn't break TLS verification."""
+    fake_counts = {
+        "general_news": 0,
+        "company_news": 0,
+        "market_prices": 0,
+        "sector_prices": 0,
+        "company_prices": 0,
+        "scored": 0,
+        "predictions": 0,
+    }
+
+    with patch("finn_predictor.ui.app.FinnhubClient") as mock_cls, patch(
+        "finn_predictor.ui.app.run_daily_ingest", return_value=fake_counts
+    ):
+        client_instance = mock_cls.return_value
+        client_instance._session.trust_env = True  # initial
+        client_instance.close = lambda: None
+        run_ingestion_with_key(session, api_key="sk-x")
+        assert client_instance._session.trust_env is False
+
+
 def test_run_ingestion_with_key_scrubs_leaked_token_from_message(session) -> None:
     """If anything in the pipeline leaks the api_key in an exception message,
     run_ingestion_with_key must redact it before re-raising."""
