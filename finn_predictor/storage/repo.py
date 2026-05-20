@@ -218,6 +218,47 @@ def save_prediction(session: Session, prediction: Prediction) -> Prediction:
     return prediction
 
 
+def migrate_predictions_to_daily(session: Session) -> int:
+    """Collapse duplicate predictions to one row per (symbol, day, model).
+
+    Before this migration, ``Prediction.prediction_date`` was stored at
+    seconds precision, so a user clicking *Run ingestion now* repeatedly
+    on a single calendar day would mint multiple rows that differed only
+    by timestamp. Going forward the predictors normalise to start-of-UTC-
+    day; this helper cleans up the existing rows.
+
+    Strategy:
+      * group predictions by ``(target_symbol, utc-day(prediction_date), model_version)``
+      * keep the row with the latest ``created_at`` per group, normalise
+        its ``prediction_date`` to the day's midnight UTC
+      * delete the other rows in the group (cascade removes any attached
+        ``PredictionOutcome``)
+
+    Returns the number of rows deleted (zero on a clean DB → idempotent).
+    """
+    all_preds = list(
+        session.scalars(
+            select(Prediction).order_by(Prediction.created_at.desc())
+        )
+    )
+    by_group: dict[tuple[str, datetime, str], list[Prediction]] = {}
+    for p in all_preds:
+        day_start, _ = utc_day_window(p.prediction_date)
+        by_group.setdefault((p.target_symbol, day_start, p.model_version), []).append(p)
+
+    deleted = 0
+    for (sym, day, mv), group in by_group.items():
+        # group is sorted DESC by created_at because the source query was;
+        # take group[0] as the survivor.
+        survivor = group[0]
+        survivor.prediction_date = day  # normalise even when no extras exist
+        for extra in group[1:]:
+            session.delete(extra)
+            deleted += 1
+    session.commit()
+    return deleted
+
+
 def predictions_for(
     session: Session,
     target_symbol: str,

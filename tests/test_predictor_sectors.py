@@ -12,6 +12,7 @@ from finn_predictor.storage.repo import (
     save_scores,
     upsert_articles,
 )
+
 from tests.conftest import make_article, make_score
 
 
@@ -144,6 +145,30 @@ def test_predict_sector_emits_flat_below_min_articles(session) -> None:
     assert pred is not None
     assert pred.label == "FLAT"
     assert pred.confidence == 0.0
+
+
+def test_predict_sector_normalises_prediction_date(session) -> None:
+    """Two same-day sector predictions should upsert to one row."""
+    sector = Sector(code="REAL_ESTATE", name="Real Estate", etf_symbol="XLRE")
+    session.add(sector)
+    session.commit()
+    _seed_company_articles(session, symbol="O", scores=[0.7, 0.8, 0.6])
+
+    morning = D.replace(hour=2, minute=15)
+    afternoon = D.replace(hour=18, minute=42)
+
+    a = predict_sector(
+        session, scorer=_FixedScorer(), sector=sector,
+        sector_symbols=["O"], on_date=morning,
+    )
+    b = predict_sector(
+        session, scorer=_FixedScorer(), sector=sector,
+        sector_symbols=["O"], on_date=afternoon,
+    )
+    assert a is not None and b is not None
+    assert a.id == b.id
+    rows = predictions_for(session, "XLRE")
+    assert len(rows) == 1
 
 
 def test_predict_sector_persists_through_repo(session) -> None:

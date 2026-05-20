@@ -102,9 +102,13 @@ def predict_sector(
     else:
         label, confidence = classify(z)
 
+    # See note in predict_market: normalise to start-of-UTC-day so the
+    # save_prediction upsert collapses same-day runs into one row.
+    prediction_day, _ = utc_day_window(on_date)
+
     pred = Prediction(
         target_symbol=sector.etf_symbol,
-        prediction_date=on_date,
+        prediction_date=prediction_day,
         label=label,
         confidence=confidence,
         sentiment_index=today_summary.weighted_mean,

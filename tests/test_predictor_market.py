@@ -124,6 +124,39 @@ def test_predict_market_is_idempotent_for_same_date(session) -> None:
     assert len(rows) == 1
 
 
+def test_predict_market_normalises_prediction_date_to_utc_midnight(session) -> None:
+    """Two calls with different timestamps on the same UTC day must upsert
+    the SAME row — fixes the duplicate-predictions bug."""
+    _seed_day(session, ids=list(range(60, 70)), scores=[0.8] * 10, day=D)
+
+    morning = D.replace(hour=3, minute=48, second=11, microsecond=399988)
+    afternoon = D.replace(hour=16, minute=6, second=2, microsecond=278856)
+
+    a = predict_market(session, scorer=_FixedScorer(), on_date=morning)
+    b = predict_market(session, scorer=_FixedScorer(), on_date=afternoon)
+    assert a is not None and b is not None
+    assert a.id == b.id
+
+    rows = predictions_for(session, "^GSPC")
+    assert len(rows) == 1
+    # prediction_date stored at start-of-day UTC.
+    stored = rows[0].prediction_date
+    expected_naive = D.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    assert (stored.replace(tzinfo=None) if stored.tzinfo else stored) == expected_naive
+
+
+def test_predict_market_separate_rows_on_different_days(session) -> None:
+    """Same predictor on two different UTC days → two rows."""
+    day1 = D
+    day2 = D + timedelta(days=1)
+    _seed_day(session, ids=list(range(70, 80)), scores=[0.7] * 10, day=day1)
+    _seed_day(session, ids=list(range(80, 90)), scores=[-0.7] * 10, day=day2)
+    predict_market(session, scorer=_FixedScorer(), on_date=day1)
+    predict_market(session, scorer=_FixedScorer(), on_date=day2)
+    rows = predictions_for(session, "^GSPC")
+    assert len(rows) == 2
+
+
 def test_predict_market_uses_baseline_to_dampen_calls(session) -> None:
     # Trailing 10 days are mildly positive (mean ~ 0.4); today is identical.
     # That should NOT trigger UP — the z-score will be ~0.

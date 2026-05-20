@@ -28,7 +28,7 @@ from finn_predictor.predictor.aggregate import (
 )
 from finn_predictor.sentiment.base import Scorer
 from finn_predictor.storage.models import Prediction
-from finn_predictor.storage.repo import save_prediction
+from finn_predictor.storage.repo import save_prediction, utc_day_window
 
 
 logger = logging.getLogger(__name__)
@@ -90,9 +90,16 @@ def predict_market(
     else:
         label, confidence = classify(z)
 
+    # Normalise to start-of-UTC-day so two runs on the same calendar day
+    # collide on save_prediction's unique key and upsert the same row.
+    # Without this, every click of "Run ingestion now" would mint a
+    # fresh Prediction row that differs only in the seconds-precision
+    # timestamp, double-counting in History and the rolling baseline.
+    prediction_day, _ = utc_day_window(on_date)
+
     pred = Prediction(
         target_symbol=symbol,
-        prediction_date=on_date,
+        prediction_date=prediction_day,
         label=label,
         confidence=confidence,
         sentiment_index=today.weighted_mean,

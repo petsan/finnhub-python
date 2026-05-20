@@ -12,6 +12,7 @@ from finn_predictor.storage.repo import (
     articles_in_window,
     ensure_default_sectors,
     latest_price_bar,
+    migrate_predictions_to_daily,
     price_bars,
     predictions_for,
     save_outcome,
@@ -127,6 +128,78 @@ def test_ensure_default_sectors_is_idempotent(session) -> None:
     assert {s.code for s in first} == {code for code, *_ in DEFAULT_SECTORS}
     assert len(first) == len(second) == len(DEFAULT_SECTORS)
     assert {s.code for s in all_sectors(session)} == {s.code for s in first}
+
+
+def test_migrate_predictions_collapses_same_day_duplicates(session) -> None:
+    """4 predictions across one UTC day → 1 row with prediction_date at midnight."""
+    base_day = datetime(2026, 5, 20, tzinfo=timezone.utc)
+    timestamps = [
+        base_day.replace(hour=3, minute=48),
+        base_day.replace(hour=3, minute=55),
+        base_day.replace(hour=3, minute=59),
+        base_day.replace(hour=4, minute=6),
+    ]
+    for i, ts in enumerate(timestamps):
+        save_prediction(
+            session,
+            make_prediction(
+                target_symbol="^GSPC",
+                prediction_date=ts,
+                label="DOWN",
+                confidence=1.0,
+                sentiment_index=-0.463,
+                article_count=3,
+                model_version="vader-test",
+            ),
+        )
+
+    assert len(predictions_for(session, "^GSPC")) == 4
+    deleted = migrate_predictions_to_daily(session)
+    assert deleted == 3
+    rows = predictions_for(session, "^GSPC")
+    assert len(rows) == 1
+
+    # The kept row's prediction_date is now midnight UTC for that day.
+    stored = rows[0].prediction_date
+    actual = stored.replace(tzinfo=None) if stored.tzinfo else stored
+    assert actual == datetime(2026, 5, 20, 0, 0, 0)
+
+
+def test_migrate_predictions_keeps_separate_days(session) -> None:
+    """Predictions on different UTC days must NOT be collapsed."""
+    d1 = datetime(2026, 5, 19, 14, tzinfo=timezone.utc)
+    d2 = datetime(2026, 5, 20, 14, tzinfo=timezone.utc)
+    save_prediction(session, make_prediction(target_symbol="^GSPC", prediction_date=d1))
+    save_prediction(session, make_prediction(target_symbol="^GSPC", prediction_date=d2))
+    migrate_predictions_to_daily(session)
+    rows = predictions_for(session, "^GSPC")
+    assert len(rows) == 2
+
+
+def test_migrate_predictions_idempotent_on_clean_db(session) -> None:
+    """Re-running the migration after it's clean must be a no-op."""
+    save_prediction(
+        session,
+        make_prediction(
+            target_symbol="^GSPC",
+            prediction_date=datetime(2026, 5, 19, tzinfo=timezone.utc),
+        ),
+    )
+    assert migrate_predictions_to_daily(session) == 0
+    assert migrate_predictions_to_daily(session) == 0
+    assert len(predictions_for(session, "^GSPC")) == 1
+
+
+def test_migrate_predictions_keeps_separate_target_symbols(session) -> None:
+    """Same day, different target_symbols → don't collapse."""
+    d = datetime(2026, 5, 19, 14, tzinfo=timezone.utc)
+    save_prediction(session, make_prediction(target_symbol="^GSPC", prediction_date=d))
+    save_prediction(session, make_prediction(target_symbol="XLK", prediction_date=d))
+    save_prediction(session, make_prediction(target_symbol="XLE", prediction_date=d))
+    migrate_predictions_to_daily(session)
+    assert len(predictions_for(session, "^GSPC")) == 1
+    assert len(predictions_for(session, "XLK")) == 1
+    assert len(predictions_for(session, "XLE")) == 1
 
 
 def test_utc_day_window_normalises_to_midnight() -> None:
