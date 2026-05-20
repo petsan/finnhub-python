@@ -18,9 +18,16 @@ with VADER, and aggregates the day's signal into a directional **Call**
 * every individual stock ticker you ask it to follow.
 
 Each Call carries a **confidence** number (0 = no signal, 1 = the
-classifier's maximum). The classifier is a rule, not a fitted model —
-read paragraph 5 of any "Why this Call?" explanation for the full
-list of caveats.
+classifier's maximum). Two classifier modes are supported:
+
+* **Rule** (default) — confidence is the normalised z-score distance
+  between today's sentiment and the 30-day rolling baseline. Fast,
+  hand-tuneable, runs on day 1 with no fitted state.
+* **Logistic regression** (`FINN_PREDICTOR_CLASSIFIER=logreg`) —
+  confidence is a calibrated probability gap `|2P − 1|` from a
+  logistic regression fitted on closed outcomes. Read paragraph 5 of
+  any "Why this Call?" explanation in either mode for the full list
+  of caveats. See §5.7 below for how to switch.
 
 **This is not investment advice.** The dashboard is a market-mood gauge
 that you can train against its own historical hit-rate. Predictions are
@@ -127,6 +134,17 @@ the prediction date.
 
 One row per sector ETF, with its current Call and the underlying ticker.
 Click into a sector via *Focus* if you want details.
+
+**Cap-weighted aggregation.** When the database has cached
+constituents (via *Focus → Sector → Refresh constituents*) and
+`historical_market_cap` rows for those constituents, sector sentiment
+is weighted by each company's most recent market cap. A bullish AAPL
+headline outweighs a bullish $500M small-cap headline by orders of
+magnitude — closer to how the sector ETF itself behaves. Tickers with
+no cap row keep weight 1.0, so sectors silently fall back to uniform
+weighting until caps are ingested. The daily ingest now pulls caps
+both for the user-listed *Company tickers* AND every cached
+constituent automatically; no extra clicks needed.
 
 ### 3.4 Performance
 
@@ -283,6 +301,59 @@ rows get an "Activate v\<n\>" button so you can revert at any time.
   — the column is then driven by cosine similarity on
   `all-MiniLM-L6-v2` embeddings (~80 MB on first download).
 
+### 5.7 Switching to the calibrated classifier
+
+The default **rule** classifier emits confidence as normalised
+z-distance — relative ranking is meaningful but the number isn't a
+probability. Once you've accumulated ≥10 closed UP/DOWN predictions
+with both directions represented, you can fit a calibrated logistic
+regression:
+
+```bash
+# Inside the deployed environment (LXC, Docker, or bare-metal venv):
+python -m finn_predictor.cli fit-classifier
+# → prints {"beta": …, "intercept": …, "n_samples": …}
+```
+
+The calibration is stored as JSON in the `app_settings` table —
+single row, refreshed every time you run the command. Activate it by
+setting `FINN_PREDICTOR_CLASSIFIER=logreg` and restarting the service.
+From that point forward, the *Today*-tab confidence becomes a real
+probability gap `|2P − 1|` instead of z-distance, and the FLAT band
+shrinks to the calibrated dead-zone around `P=0.5`.
+
+If you flip the env back to `rule` (or never set it), the rule
+classifier resumes — the saved calibration sits unused but isn't
+deleted, so you can A/B between modes by restarting with a different
+env value. The mode falls back to `rule` silently when no calibration
+is fitted, so you can set the env var on a fresh deploy without
+breaking anything.
+
+### 5.8 Switching the sentiment scorer
+
+VADER is the default. To switch to FinBERT (better at finance
+jargon, ~440 MB of model weights):
+
+```bash
+# In the deployment env (LXC inside, Docker compose, or your venv)
+pip install torch transformers
+export FINN_PREDICTOR_SCORER=finbert
+# Restart the service.
+```
+
+The first ingest after the switch downloads the weights and
+re-scores any unscored articles under the new `model_version`. Old
+VADER scores are kept (sentiment scoring is unique per
+`(article, model_version)`), so the history is preserved. If you
+flip back to VADER later, the old scores light up again.
+
+When a scorer-mismatch is detected at startup (live scorer's
+`model_version` ≠ most recent prediction's), a `WARNING` log line
+appears explaining that the rolling baseline is now stale. Run
+`python -m finn_predictor.cli retrain` after a few sessions to
+refit the learned weights against the new scorer's score
+distribution.
+
 ---
 
 ## 6. Troubleshooting
@@ -325,6 +396,38 @@ ETFs/futures specific).
 You need at least 10 closed trades (Predictions with Outcomes) for
 training to be meaningful. Run more ingestion + price backfill first.
 
+### Logs show `WARNING scorer mismatch: live pipeline configured for 'vader-…' but most recent prediction was written with 'finbert-…'`
+
+You changed `FINN_PREDICTOR_SCORER` (or vice versa) without retraining.
+Predictions written under the old scorer are still in the DB, but the
+rolling baseline they belong to doesn't share a `model_version` with
+new predictions, so today's call won't benefit from the old history
+until a few fresh days accumulate. Two options:
+
+* Wait. After ~30 days under the new scorer the rolling baseline is
+  fully populated from the matching `model_version` and the warning
+  stops.
+* Re-run `python -m finn_predictor.cli retrain` once enough closed
+  outcomes have accumulated under the new scorer. The learning loop
+  will fit fresh weights against the new score distribution.
+
+The warning is informational, not a failure — predictions keep
+writing throughout.
+
+### `cli fit-classifier` returns rc=3 "need at least 10 closed UP/DOWN predictions"
+
+You haven't accumulated enough outcomes yet. Run more ingestion +
+**Backfill prices** cycles so the backtester closes more trades, then
+re-fit. If you've never run *Backfill historical news* + *Backfill
+prices*, do that first — historical retro-predictions count toward
+the calibration set.
+
+### `cli fit-classifier` returns rc=3 "all closed outcomes landed on a single class"
+
+Every closed prediction in your ledger went the same direction. The
+fit has no decision boundary to learn. Wait for more data, or expand
+the universe (more tickers, longer backfill).
+
 ### Learning tab shows "gate blocked"
 
 The new candidate scored below the active version on the holdout
@@ -358,8 +461,14 @@ If you see the red text, your key really lost access.
 
 ## 7. Where to go next
 
-- **`installation-manual.md`** — getting a fresh instance running
-  (venv or Docker), upgrading, resetting, backing up.
+- **`installation-manual.md`** — getting a fresh dev instance running
+  locally (venv or Docker), env-var reference, upgrading, resetting,
+  backing up.
+- **`deployment-manual.md`** — production deployment paths (Proxmox
+  LXC, Docker, bare metal), reverse proxy + TLS, monitoring, log
+  aggregation, hardening checklist.
+- **`deploy/proxmox/install.sh`** — one-shot Proxmox LXC installer
+  (read `deployment-manual.md` §1 first).
 - **`summary.md`** — top-level architecture overview.
 - **`progress.md`** — design decisions and implementation status.
 - **`diff.md`** — per-commit change log on the `finn-predictor` branch.

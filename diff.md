@@ -506,6 +506,215 @@ New deps:
 
 ---
 
+## 61a9958 — sprint: cap-weighted sectors, pluggable scorer, calibrated classifier
+
+*28 files, +1529 / −38*
+
+Closes the three open "Known limitations / next steps" items from
+`progress.md §3.6` in one pass, plus a CLI test coverage lift.
+
+**Cap-weighted sector aggregates.** New
+`HistoricalMarketCap(symbol, as_of_date, market_cap)` model with a
+unique `(symbol, as_of_date)` constraint. Companion repo helpers:
+
+* `upsert_market_caps(session, caps)` — dialect-aware insert with
+  no-op-on-conflict (matches `upsert_price_bars`).
+* `latest_market_caps(session, symbols, *, on_or_before=None)` —
+  returns `{symbol: cap}` from the most recent snapshot per ticker;
+  `on_or_before` guards historical backtests against look-ahead.
+
+New `FinnhubGateway.historical_market_cap(symbol, _from, to)` (Finnhub
+takes ISO dates here, not epoch seconds — gateway docstring spells
+that out). New `ingest_market_caps(session, gateway, symbol, start,
+end)` in `ingestion/prices.py` parses Finnhub's `{symbol, data:
+[{atDate, marketCapitalization}, ...]}` shape, skipping malformed
+rows. Daily ingest now calls it for every user-listed company
+ticker; failures isolated per-symbol via the same `_try` wrapper.
+
+`predict_sector` accepts `use_market_cap_weights=True` (default). When
+on and the DB has caps for any of `sector_symbols`, each article's
+per-ticker weight is multiplied by its company's most-recent cap
+(normalised to mean 1.0 across the sector so the weighted_mean stays
+in the same numeric range as the cap-less path — important because
+the rolling baseline doesn't see cap weights).
+
+**`FINN_PREDICTOR_SCORER` env toggle.** New `scorer_name` field on
+`Settings` (validated against `vader`|`finbert`). New
+`resolve_active_scorer()` helper in `sentiment/__init__.py` reads
+the env directly (so short-lived callbacks don't need a Settings
+instance) and falls back to VADER on unknown / blank values — the
+UI must not crash at startup over a typo. Routed through every live
+scoring site: `cmd_ingest` (CLI), `run_ingestion_with_key` and
+`run_backfill_with_key` (UI), Focus tab's version display, and the
+training loop's `model_version` selector.
+
+**Logistic-regression classifier mode.** New
+`predictor/classifier.py` with:
+
+* `LogisticCalibration(beta, intercept, n_samples)` dataclass.
+* `_fit_logreg_newton(xs, ys)` — pure-Python 2-param Newton-Raphson
+  MLE with a small `eps=1e-3` L2 prior (otherwise a separable
+  training set sends |beta| → ∞). Iterates ≤ 50 times to ≤ 1e-7
+  step norm.
+* `fit_logreg_calibration(session, model_version, target_symbol=None)`
+  — walks closed UP/DOWN predictions, raises
+  `NotEnoughCalibrationDataError` when < 10 samples or all on one
+  class, returns the fitted calibration.
+* `apply_logreg_classification(sentiment_index, calibration,
+  decision_band=0.05)` → `(label, confidence)`. Probability above
+  `0.5 + band` → UP, below `0.5 - band` → DOWN, else FLAT.
+  Confidence is `|2P − 1|` — a calibrated probability gap.
+* `save_calibration` / `load_calibration` — JSON blob in a single
+  `AppSetting` row (`logreg_calibration`).
+* `resolve_classifier_mode()` reads `FINN_PREDICTOR_CLASSIFIER`
+  (default `rule`, alt `logreg`).
+
+Predictor signatures grew an optional `calibration=` parameter
+(market, sectors, stocks, plus `predict_all_sectors` /
+`predict_all_stocks` for the fan-out). `run_daily_ingest` loads
+the calibration once per call when the env is `logreg`.
+
+New CLI subcommand `python -m finn_predictor.cli fit-classifier
+[--target-symbol SYM]`. Filters the training set by the active
+scorer's `model_version` so VADER + FinBERT predictions don't get
+mixed.
+
+**CLI test coverage lift.** New tests for `cmd_ingest` happy path
+(via `run_daily_ingest` mock), `hash-password` stdin / EOF /
+too-long paths, `retrain --activate yes|no`. `cli.py` 77% → 96%.
+
+**Net test count:** 337 → 381 passing. Overall coverage: 95% → 96%.
+`classifier.py` lands at 95% straight out of the gate. Docs:
+`progress.md §3.6` strikes three items, §4 changelog appends six
+2026-05-20 entries, §5.4 refreshes test posture. `summary.md`
+Limitations + Features aligned. `installation-manual.md` documents
+the two new env vars.
+
+---
+
+## 24314ff — follow-up: constituent caps, scorer-mismatch warning, UI smoke tests
+
+*8 files, +446 / −19*
+
+Closes the last cap-weighting gap from the prior commit, plus two
+adjacent items.
+
+**Cap ingest fan-out across cached sector constituents.** After the
+per-company loop, `run_daily_ingest` now walks every `Sector`'s
+cached `RelatedEntity(ETF_HOLDING)` rows and pulls
+`historical_market_cap` for each constituent — deduped against the
+user-listed tickers via a per-run `caps_ingested` set so we never
+call `/historical-market-cap` twice for the same symbol. New
+`constituent_caps` count and per-symbol failure isolation. Sectors
+built purely from constituents now also pick up cap weighting,
+without listing each ticker explicitly.
+
+**Scorer-mismatch warning.** New `detect_scorer_mismatch` /
+`warn_if_scorer_mismatch` helpers in the sentiment package compare
+the live scorer's `model_version` against the most recent
+`Prediction.model_version`. On drift, the WARNING explains that the
+rolling baseline is now stale and points at the `retrain` CLI.
+Hooked into both the CLI `ingest` path and the UI's
+`run_ingestion_with_key`. Silent on a matching DB or an empty DB.
+
+**UI smoke tests via `streamlit.testing.v1.AppTest`.** New
+`tests/test_ui_smoke.py` boots `ui/app.py` against a per-test
+SQLite fixture and asserts (a) no exceptions at import/boot, (b) the
+`Finn-Predictor` title renders, (c) all six tab labels appear, (d)
+the bootstrap copy shows on a fresh DB, (e) a seeded UP prediction
+surfaces in the Today-tab metrics. AppTest runs the script in its
+own context so line coverage isn't captured; `ui/app.py` stays in
+`.coveragerc` `omit` but is now behind four explicit regression
+tests.
+
+**Net:** 381 → 392 passing, 96% coverage maintained.
+
+---
+
+## dcaa18c — storage+ui: pluggable story clustering (prefix default, embedding opt-in)
+
+*8 files, +564 / −12*
+
+Closes the last documented heuristic in `progress.md §3.6`:
+paraphrased reposts that share an event but rewrite the lead now
+cluster correctly when the embedding clusterer is active, while the
+default deploy keeps the dependency-free behaviour unchanged.
+
+New module `finn_predictor/storage/clustering.py`:
+
+* `Clusterer` Protocol — one method, `earliest_times(session,
+  headlines, *, lookback_days, now) -> dict[str, datetime|None]`.
+* `PrefixClusterer` (default) — thin wrapper around the existing
+  `earliest_story_times` so the call sites can hold a single
+  `Clusterer` instance regardless of mode.
+* `EmbeddingClusterer` — pulls every article in the lookback window,
+  embeds the input + candidate headlines in one batched call,
+  clusters by cosine similarity ≥ threshold (default 0.7), returns
+  the earliest `published_at` per input. Sentence-transformers is
+  lazy-imported on first use (default model `all-MiniLM-L6-v2`,
+  ~80 MB on first download); an injectable `embed_fn` keeps tests
+  hermetic.
+* `resolve_active_clusterer()` — env-driven picker; default
+  `prefix`, `embedding` opts in, unknown values fall back to prefix.
+
+Resilience: a failing embed call (model load fails, OOM, network
+flake) logs a WARNING and falls back to the prefix matcher rather
+than blanking the *first reported* column.
+
+Pure-Python cosine math (no numpy dependency at the type boundary).
+UI wiring: the two callers in `finn_predictor/ui/app.py` that
+previously imported `earliest_story_times` directly now route
+through `resolve_active_clusterer().earliest_times(...)`.
+
+**Tests** (17 new, in `tests/test_clustering.py`): pure cosine math,
+PrefixClusterer protocol compliance + parity with the legacy helper,
+EmbeddingClusterer with injected `embed_fn` (paraphrase clustering,
+threshold enforcement, empty inputs, empty window, batch dedupe,
+fallback-on-failure), env-driven resolver paths.
+
+**Net:** 392 → 409 passing, 96% coverage maintained. No new runtime
+dependencies — `sentence-transformers` is opt-in.
+
+---
+
+## HEAD — docs + Proxmox deployment script
+
+*8 files, +~1200 / −few*
+
+Deployment story rounded out:
+
+* **`deploy/proxmox/install.sh`** — one-shot Proxmox LXC installer.
+  Provisions an unprivileged Ubuntu 24.04 LXC (1 GB / 2 cores / 8 GB
+  default; overridable via env or `--memory` / `--cores` / `--disk`
+  flags), installs Python 3.12 + the app, drops a hardened systemd
+  unit (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`,
+  `ProtectHome`, scoped `ReadWritePaths`), starts the service.
+  Idempotent: re-runs against an existing CTID refresh the app and
+  restart the service without touching the SQLite DB under
+  `/opt/finn-predictor/data`. `--remove` for teardown. Optional
+  flags for FinBERT (`--with-finbert`) and embedding clusterer
+  (`--with-embeddings`).
+* **`deployment-manual.md`** — new top-level doc with three
+  deployment paths (Proxmox LXC primary, Docker, bare metal),
+  reverse-proxy + TLS recipes (Caddy and nginx), backup/restore
+  commands, health-check endpoints, monitoring hooks, hardening
+  checklist.
+* **`user-manual.md`** — caught up with the recent sprints: §1
+  mentions both classifier modes, §3.3 documents cap-weighted sector
+  aggregation, §5.7/§5.8 add walkthroughs for switching the
+  classifier and scorer, §6 picks up new troubleshooting cases
+  (scorer-mismatch warning, fit-classifier rc=3 paths). §7 points
+  at the new deployment manual.
+* **`README.md`** — top-of-file branch note explaining what's in this
+  fork and linking the doc set.
+* **`summary.md` / `progress.md` / `diff.md`** — refreshed test
+  posture (409 passing, 96% coverage), changelog entries, this diff
+  block.
+
+No production code changed; 409 tests still pass.
+
+---
+
 ## Files added (by directory)
 
 ```
