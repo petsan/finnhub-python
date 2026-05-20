@@ -34,5 +34,11 @@ scikit-optimize>=0.10
 # --- Auth gate (FINN_PREDICTOR_PASSWORD_HASH) ---
 bcrypt>=4.0
 
+# --- Browser-localStorage bridge for the sidebar API-key field.
+#     Self-contained Streamlit component with a bundled frontend; no
+#     transitive heavyweight deps. Pinned loose because the package
+#     is still 0.x. ---
+streamlit-local-storage>=0.0.20
+
 # --- Optional: Postgres driver. Comment out if you only use SQLite. ---
 psycopg[binary]>=3.1

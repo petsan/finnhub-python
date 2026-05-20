@@ -48,12 +48,21 @@ Everything that talks to Finnhub starts in the sidebar.
 Paste your key (get one at <https://finnhub.io/dashboard>) into the
 **API key** field. The key is masked while typing.
 
-**It lives only in this browser tab's server-side session.** It is
-never written to disk, never written to the SQLite database, never
-written to logs, and never returned in error messages — three
-independent scrubbing layers strip it from any exception text before
-display. Closing the tab or restarting the server discards it. There
-is a *Clear key* button if you want to nuke it explicitly.
+**Storage** (as of this build): the key is persisted in this
+browser's `localStorage` under the key
+`finn_predictor_finnhub_api_key`, so it survives page reloads on
+the same machine without re-pasting. It is **still never** written
+to the server's filesystem, the SQLite database, or any log file —
+three independent scrubbing layers strip it from exception text
+before display, and the new browser persistence is purely
+client-side. The *Clear key* button atomically wipes both the
+server-side session and the browser cache.
+
+If you'd rather have the legacy "session-only" behaviour (no
+browser persistence at all), set
+`FINN_PREDICTOR_DISABLE_LOCAL_STORAGE=1` in the server's env. The
+sidebar then runs exactly as before — key lives in the server-side
+session only and disappears when the tab closes.
 
 The application boots and renders the UI **without** a key — every tab
 is read-only against the existing data. You only need a key to fetch

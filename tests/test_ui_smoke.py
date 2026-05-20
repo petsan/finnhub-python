@@ -75,6 +75,11 @@ def _boot(monkeypatch, tmp_path: Path, *, seed: bool = True):
     # unset, so the AppTest run reaches the main tab strip directly.
     monkeypatch.delenv("FINN_PREDICTOR_PASSWORD_HASH", raising=False)
     monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{db_path}")
+    # Disable the localStorage bridge — its frontend component polls
+    # session_state forever in AppTest mode (the JS that posts back
+    # never runs), which would hang the boot. Production runs do not
+    # set this and get the persistence behaviour for free.
+    monkeypatch.setenv("FINN_PREDICTOR_DISABLE_LOCAL_STORAGE", "1")
     if seed:
         _seed_predictions(db_path)
 

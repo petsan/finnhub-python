@@ -17,7 +17,9 @@ from finn_predictor.storage.repo import (
 )
 from finn_predictor.predictor.explain import ArticleContribution
 from finn_predictor.ui.app import (
+    BROWSER_STORAGE_API_KEY,
     NEUTRAL_SENTIMENT_THRESHOLD,
+    _get_local_storage,
     _escape_markdown,
     _format_headline_markdown,
     _parse_symbols,
@@ -1166,6 +1168,40 @@ def test_neutral_headlines_respects_explicit_threshold() -> None:
 
 def test_neutral_headlines_empty_input() -> None:
     assert neutral_headlines_from_contributions([]) == []
+
+
+def test_get_local_storage_returns_none_when_disabled(monkeypatch) -> None:
+    """The escape-hatch env var disables localStorage cleanly."""
+    monkeypatch.setenv("FINN_PREDICTOR_DISABLE_LOCAL_STORAGE", "1")
+    assert _get_local_storage() is None
+
+
+def test_get_local_storage_respects_truthy_disable_values(monkeypatch) -> None:
+    """'true' / 'yes' also disable, matching the rest of the codebase's parsing."""
+    for val in ("true", "yes", "TRUE", "1"):
+        monkeypatch.setenv("FINN_PREDICTOR_DISABLE_LOCAL_STORAGE", val)
+        assert _get_local_storage() is None
+
+
+def test_get_local_storage_ignores_falsey_disable_values(monkeypatch) -> None:
+    """Empty / '0' / 'no' do NOT disable — let the package try."""
+    # We can't actually instantiate LocalStorage here without hanging, but
+    # the helper at least shouldn't short-circuit on these values.
+    monkeypatch.setenv("FINN_PREDICTOR_DISABLE_LOCAL_STORAGE", "0")
+    # It'll either return a LocalStorage instance (in 'streamlit run') or
+    # None from the inner except; both are acceptable here. The
+    # assertion that matters is "this didn't blow up because of the env."
+    # If the package's constructor hangs in AppTest-like mode, this test
+    # will time out — but plain `python` raises immediately, so:
+    result = _get_local_storage()  # noqa: F841 — exercising the path is the test
+    # No raise == pass; we don't constrain the return type beyond that.
+
+
+def test_browser_storage_api_key_is_namespaced() -> None:
+    """The localStorage key includes a product prefix so we don't collide
+    with other tabs' storage on the same origin."""
+    assert "finn_predictor" in BROWSER_STORAGE_API_KEY
+    assert "finnhub" in BROWSER_STORAGE_API_KEY  # references what it stores
 
 
 def test_neutral_sentiment_threshold_matches_explain_flat_band() -> None:

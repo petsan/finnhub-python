@@ -13,6 +13,7 @@ to disk or to the database.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
@@ -115,6 +116,121 @@ from finn_predictor.storage.symbol_names import expand_symbol, expand_symbol_sho
 
 API_KEY_SESSION_KEY = "finnhub_api_key"
 AUTHED_SESSION_KEY = "_finn_authenticated"
+
+# localStorage key the sidebar writes the Finnhub token under when the
+# user submits one. Persisted client-side only — the token still never
+# touches the server's filesystem or the SQLite DB. Cleared atomically
+# by the sidebar's *Clear key* button via _clear_browser_api_key().
+BROWSER_STORAGE_API_KEY = "finn_predictor_finnhub_api_key"
+_BROWSER_STORAGE_HYDRATED_FLAG = "_finn_local_storage_hydrated"
+_BROWSER_STORAGE_LAST_WRITTEN = "_finn_local_storage_last_written"
+
+
+def _get_local_storage():  # pragma: no cover - depends on Streamlit runtime
+    """Return a streamlit_local_storage handle, or ``None`` outside Streamlit.
+
+    The package's ``LocalStorage()`` constructor polls
+    ``st.session_state`` until the frontend custom component posts
+    back. That works under ``streamlit run`` but **hangs forever**
+    under ``streamlit.testing.v1.AppTest`` (which never executes the
+    component JS) and would block any other non-interactive runtime
+    the same way.
+
+    Two escape hatches keep that out of our way:
+
+    1. ``FINN_PREDICTOR_DISABLE_LOCAL_STORAGE=1`` — explicit opt-out
+       used by the smoke-test fixture and by anyone who wants the
+       legacy "session-only key" behaviour back without touching the
+       code.
+    2. ``ImportError`` — the package isn't installed at all (older
+       deploys / minimal envs).
+
+    On either, this returns ``None`` and the sidebar runs in
+    no-persistence mode without re-raising. The text-input + Clear
+    button still work; only the localStorage bridge is missing.
+    """
+    if os.environ.get("FINN_PREDICTOR_DISABLE_LOCAL_STORAGE", "").strip() in {"1", "true", "yes"}:
+        return None
+    try:
+        from streamlit_local_storage import LocalStorage
+    except ImportError:
+        return None
+    try:
+        return LocalStorage()
+    except Exception:
+        return None
+
+
+def _hydrate_api_key_from_browser() -> None:  # pragma: no cover - Streamlit UI
+    """Pre-fill ``st.session_state[API_KEY_SESSION_KEY]`` from localStorage.
+
+    Runs at most once per browser session (gated by a session_state
+    flag) so the user can still clear the field mid-session without
+    immediately repopulating it from the cache. Silent no-op when
+    localStorage isn't reachable.
+    """
+    if st.session_state.get(_BROWSER_STORAGE_HYDRATED_FLAG):
+        return
+    if st.session_state.get(API_KEY_SESSION_KEY):
+        # Already populated for this session (e.g. user typed it before
+        # the hydrate ran). Nothing to do; flag and move on.
+        st.session_state[_BROWSER_STORAGE_HYDRATED_FLAG] = True
+        return
+
+    ls = _get_local_storage()
+    if ls is None:
+        st.session_state[_BROWSER_STORAGE_HYDRATED_FLAG] = True
+        return
+
+    try:
+        stored = ls.getItem(BROWSER_STORAGE_API_KEY)
+    except Exception:
+        stored = None
+    if isinstance(stored, str) and stored.strip():
+        st.session_state[API_KEY_SESSION_KEY] = stored.strip()
+        st.session_state[_BROWSER_STORAGE_LAST_WRITTEN] = stored.strip()
+    st.session_state[_BROWSER_STORAGE_HYDRATED_FLAG] = True
+
+
+def _persist_api_key_to_browser(api_key: str) -> None:  # pragma: no cover - Streamlit UI
+    """Write the current key to localStorage if it changed since last write.
+
+    Idempotent: each render doesn't re-call setItem unless the key
+    actually changed. Storing the last-written value in session_state
+    avoids spamming the component bridge on every rerun.
+    """
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return
+    if st.session_state.get(_BROWSER_STORAGE_LAST_WRITTEN) == api_key:
+        return
+    ls = _get_local_storage()
+    if ls is None:
+        return
+    try:
+        ls.setItem(BROWSER_STORAGE_API_KEY, api_key)
+        st.session_state[_BROWSER_STORAGE_LAST_WRITTEN] = api_key
+    except Exception:
+        # localStorage write failed — leave session_state untouched so
+        # the next render will retry.
+        pass
+
+
+def _clear_browser_api_key() -> None:  # pragma: no cover - Streamlit UI
+    """Remove the persisted key from localStorage.
+
+    Called by the *Clear key* button so the wipe is atomic across
+    server session_state and browser cache. Survives the case where
+    localStorage isn't reachable (no-op).
+    """
+    st.session_state.pop(_BROWSER_STORAGE_LAST_WRITTEN, None)
+    ls = _get_local_storage()
+    if ls is None:
+        return
+    try:
+        ls.deleteItem(BROWSER_STORAGE_API_KEY)
+    except Exception:
+        pass
 
 
 def _enforce_auth_gate() -> bool:  # pragma: no cover - Streamlit UI
@@ -1042,13 +1158,19 @@ class _SidebarState:
 
 def _render_sidebar() -> _SidebarState:  # pragma: no cover - Streamlit UI
     """Render the API-key + ingestion + backfill sidebar."""
+    # Hydrate the key from browser localStorage on the first render
+    # of this session. Must run BEFORE the text_input below, because
+    # the input's value comes from st.session_state[API_KEY_SESSION_KEY].
+    _hydrate_api_key_from_browser()
+
     with st.sidebar:
         st.header("Finnhub API key")
         st.caption(
-            "Required to fetch news and prices. Stored **only** in this "
-            "browser tab's server-side session — never written to disk or "
-            "the database. Closing the tab or restarting the server "
-            "discards it."
+            "Required to fetch news and prices. Persisted in this "
+            "browser's **localStorage** so it survives page reloads, "
+            "but **never** written to the server's disk or the SQLite "
+            "database. *Clear key* wipes both the session and the "
+            "browser cache."
         )
         st.text_input(
             "API key",
@@ -1060,7 +1182,10 @@ def _render_sidebar() -> _SidebarState:  # pragma: no cover - Streamlit UI
 
         current = (st.session_state.get(API_KEY_SESSION_KEY) or "").strip()
         if current:
-            st.success("✓ key set for this session")
+            # Mirror the in-memory value into the browser cache the
+            # first time we see it (no-op if unchanged since last write).
+            _persist_api_key_to_browser(current)
+            st.success("✓ key set (cached in browser)")
         else:
             st.warning("no key set — ingestion disabled")
 
@@ -1073,7 +1198,16 @@ def _render_sidebar() -> _SidebarState:  # pragma: no cover - Streamlit UI
         col_clear, col_run = st.columns(2)
         with col_clear:
             if st.button("Clear key", disabled=not current):
+                # Atomic wipe: server session + browser cache. Both
+                # have to go in the same click, otherwise the next
+                # rerun would re-hydrate from cache.
                 st.session_state.pop(API_KEY_SESSION_KEY, None)
+                _clear_browser_api_key()
+                # Reset the hydrate flag so a manual page refresh after
+                # this click doesn't auto-pull from cache either (the
+                # delete should already have made that a no-op, but
+                # cheap defence in depth).
+                st.session_state.pop(_BROWSER_STORAGE_HYDRATED_FLAG, None)
                 st.rerun()
         with col_run:
             run_clicked = st.button("Run ingestion now", disabled=not current)
