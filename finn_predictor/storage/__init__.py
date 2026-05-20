@@ -10,6 +10,11 @@ from finn_predictor.storage.models import (
     Sector,
     SentimentScore,
 )
+from finn_predictor.storage.symbol_names import (
+    WELL_KNOWN_NAMES,
+    expand_symbol,
+    expand_symbol_short,
+)
 
 __all__ = [
     "Base",
@@ -19,6 +24,9 @@ __all__ = [
     "PredictionOutcome",
     "Sector",
     "SentimentScore",
+    "WELL_KNOWN_NAMES",
     "create_engine_and_session",
+    "expand_symbol",
+    "expand_symbol_short",
     "init_db",
 ]

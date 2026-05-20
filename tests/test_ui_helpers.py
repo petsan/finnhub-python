@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import pandas as pd
 import pytest
 
 from finn_predictor.storage.models import NewsArticle, PredictionOutcome, Sector
@@ -19,6 +20,8 @@ from finn_predictor.ui.app import (
     _escape_markdown,
     _format_headline_markdown,
     _parse_symbols,
+    build_contribution_chart,
+    contribution_chart_data,
     headlines_from_contributions,
     latest_market_prediction,
     latest_predictions,
@@ -225,6 +228,137 @@ def test_headlines_from_contributions_respects_limit(session) -> None:
     assert len(rows) == 5
 
 
+# ---------------- contribution chart ----------------
+
+
+def _make_contribs(session, items):
+    """Insert articles + return ArticleContribution stubs in the same order."""
+    from finn_predictor.storage.repo import upsert_articles
+
+    arts = []
+    for i, (headline, score, contrib) in enumerate(items):
+        arts.append(
+            make_article(
+                finnhub_id=i + 1,
+                headline=headline,
+                symbol="AAPL" if i == 0 else "",
+                published_at=D,
+            )
+        )
+    upsert_articles(session, arts)
+    persisted = (
+        session.query(type(arts[0]))
+        .order_by(type(arts[0]).finnhub_id)
+        .all()
+    )
+    contribs = []
+    for art, (_, score, contrib) in zip(persisted, items):
+        contribs.append(
+            ArticleContribution(
+                article=art,
+                score=score,
+                weight=1.0,
+                contribution=contrib,
+                supports_call=contrib > 0,
+            )
+        )
+    return contribs
+
+
+def test_contribution_chart_data_empty_returns_typed_frame(session) -> None:
+    df = contribution_chart_data([])
+    assert df.empty
+    for col in ("x", "contribution", "direction", "supports_call"):
+        assert col in df.columns
+
+
+def test_contribution_chart_data_sorted_ascending_by_contribution(session) -> None:
+    contribs = _make_contribs(
+        session,
+        [
+            ("middle", 0.0, 0.0),
+            ("very negative", -0.9, -0.5),
+            ("slightly positive", 0.2, 0.1),
+            ("very positive", 0.95, 0.4),
+        ],
+    )
+    df = contribution_chart_data(contribs)
+    # Ascending order: most negative first.
+    assert list(df["contribution"]) == sorted(c.contribution for c in contribs)
+    assert list(df["x"]) == [0, 1, 2, 3]
+
+
+def test_contribution_chart_data_direction_labels(session) -> None:
+    contribs = _make_contribs(
+        session,
+        [
+            ("neg", -0.5, -0.3),
+            ("zero", 0.0, 0.0),
+            ("pos", 0.5, 0.2),
+        ],
+    )
+    df = contribution_chart_data(contribs)
+    dirs = dict(zip(df["headline"], df["direction"]))
+    assert dirs["neg"] == "negative"
+    assert dirs["zero"] == "neutral"
+    assert dirs["pos"] == "positive"
+
+
+def test_contribution_chart_data_expands_ticker_when_session_passed(session) -> None:
+    contribs = _make_contribs(session, [("Apple news", 0.6, 0.3)])
+    df = contribution_chart_data(contribs, session=session)
+    assert df.iloc[0]["company"] == "Apple Inc."
+
+
+def test_contribution_chart_data_no_session_leaves_company_blank(session) -> None:
+    contribs = _make_contribs(session, [("Apple news", 0.6, 0.3)])
+    df = contribution_chart_data(contribs, session=None)
+    assert df.iloc[0]["company"] == ""
+
+
+def test_build_contribution_chart_returns_altair_chart() -> None:
+    """Smoke test: the chart builder produces something Streamlit can render."""
+    import altair as alt
+
+    df = pd.DataFrame(
+        [
+            {
+                "x": 0,
+                "contribution": -0.3,
+                "sentiment": -0.5,
+                "headline": "A",
+                "source": "S",
+                "symbol": "",
+                "company": "",
+                "direction": "negative",
+                "supports_call": False,
+            },
+            {
+                "x": 1,
+                "contribution": 0.3,
+                "sentiment": 0.5,
+                "headline": "B",
+                "source": "S",
+                "symbol": "",
+                "company": "",
+                "direction": "positive",
+                "supports_call": True,
+            },
+        ]
+    )
+    chart = build_contribution_chart(df, title="t")
+    # Round-trip through Vega-Lite JSON to confirm the spec is valid.
+    spec = chart.to_dict()
+    assert spec["mark"]["type"] == "bar"
+    assert spec["encoding"]["x"]["field"] == "x"
+    assert spec["encoding"]["y"]["field"] == "contribution"
+    assert spec["encoding"]["color"]["field"] == "direction"
+    # Tooltip lists must include headline & contribution.
+    tooltip_fields = {t["field"] for t in spec["encoding"]["tooltip"]}
+    assert "headline" in tooltip_fields
+    assert "contribution" in tooltip_fields
+
+
 # ---------------- headline markdown formatting ----------------
 
 
@@ -329,6 +463,38 @@ def test_format_headline_markdown_omits_marker_when_supports_unknown() -> None:
     )
     assert not line.startswith("🟢") and not line.startswith("🔴")
     assert "contrib" not in line
+
+
+def test_format_headline_markdown_uses_company_name_when_present() -> None:
+    """The headline row should show 'Apple Inc. (`AAPL`)' instead of '`AAPL`'."""
+    line = _format_headline_markdown(
+        {
+            "headline": "Apple ships chip",
+            "url": "https://x/y",
+            "source": "",
+            "symbol": "AAPL",
+            "company": "Apple Inc.",
+            "published_at": None,
+            "sentiment": 0.5,
+        }
+    )
+    assert "Apple Inc. (`AAPL`)" in line
+    # Make sure we don't ALSO have a bare `AAPL` token elsewhere.
+    assert "· `AAPL` ·" not in line
+
+
+def test_format_headline_markdown_falls_back_when_no_company() -> None:
+    line = _format_headline_markdown(
+        {
+            "headline": "h",
+            "url": "https://x/y",
+            "source": "",
+            "symbol": "ZZZ",
+            "published_at": None,
+            "sentiment": 0.5,
+        }
+    )
+    assert "`ZZZ`" in line
 
 
 def test_format_headline_markdown_handles_empty_headline() -> None:

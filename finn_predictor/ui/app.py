@@ -14,8 +14,9 @@ to disk or to the database.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from typing import Iterable, Sequence
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 from finnhub import Client as FinnhubClient
@@ -45,6 +46,7 @@ from finn_predictor.storage.models import (
     SentimentScore,
 )
 from finn_predictor.storage.repo import all_sectors, predictions_for
+from finn_predictor.storage.symbol_names import expand_symbol, expand_symbol_short
 
 
 API_KEY_SESSION_KEY = "finnhub_api_key"
@@ -195,6 +197,114 @@ def prediction_history(
     )
 
 
+def contribution_chart_data(
+    contributions: Sequence[ArticleContribution],
+    *,
+    session: Session | None = None,
+) -> pd.DataFrame:
+    """Build a DataFrame ready for an Altair contribution chart.
+
+    Columns:
+
+    * ``x`` — integer rank 0..N-1, ordered most-negative → most-positive
+      (i.e. left-to-right along the chart's x-axis goes from −1 toward
+      +1 in contribution space).
+    * ``contribution`` — the signed contribution (y-axis value).
+    * ``sentiment`` — raw score for the tooltip.
+    * ``headline``, ``source``, ``symbol`` — tooltip text.
+    * ``company`` — expanded ticker (if a session is provided).
+    * ``direction`` — ``"positive"`` / ``"negative"`` / ``"neutral"``,
+      used by the chart's colour scale.
+    * ``supports_call`` — for the tooltip text only.
+    """
+    if not contributions:
+        return pd.DataFrame(
+            columns=[
+                "x",
+                "contribution",
+                "sentiment",
+                "headline",
+                "source",
+                "symbol",
+                "company",
+                "direction",
+                "supports_call",
+            ]
+        )
+
+    # Sort ascending by contribution so x-axis runs left=most-negative,
+    # right=most-positive (matches the spec).
+    ordered = sorted(contributions, key=lambda c: c.contribution)
+    rows: list[dict[str, object]] = []
+    for i, c in enumerate(ordered):
+        if c.contribution > 0:
+            direction = "positive"
+        elif c.contribution < 0:
+            direction = "negative"
+        else:
+            direction = "neutral"
+        sym = c.article.symbol or ""
+        rows.append(
+            {
+                "x": i,
+                "contribution": c.contribution,
+                "sentiment": c.score,
+                "headline": c.article.headline,
+                "source": c.article.source or "",
+                "symbol": sym,
+                "company": expand_symbol(session, sym) if (session and sym) else "",
+                "direction": direction,
+                "supports_call": c.supports_call,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_contribution_chart(df: pd.DataFrame, *, title: str = "") -> alt.Chart:
+    """Divergent vertical-bar chart of per-article contributions.
+
+    Positive contributions extend upward from the 0-line, negative ones
+    downward. Bars are coloured by sign (green/red, with a neutral grey
+    for FLAT-band contributions). Tooltips show headline + source +
+    sentiment + signed contribution.
+    """
+    color_scale = alt.Scale(
+        domain=["negative", "neutral", "positive"],
+        range=["#d62728", "#9aa0a6", "#2ca02c"],
+    )
+    return (
+        alt.Chart(df)
+        .mark_bar(size=14)
+        .encode(
+            x=alt.X(
+                "x:O",
+                axis=alt.Axis(labels=False, ticks=False, title="articles ordered −1 → 0 → +1"),
+                sort=None,
+            ),
+            y=alt.Y(
+                "contribution:Q",
+                axis=alt.Axis(title="signed contribution"),
+                scale=alt.Scale(zero=True),
+            ),
+            color=alt.Color(
+                "direction:N",
+                scale=color_scale,
+                legend=alt.Legend(title="direction"),
+            ),
+            tooltip=[
+                alt.Tooltip("headline:N", title="Headline"),
+                alt.Tooltip("source:N", title="Source"),
+                alt.Tooltip("symbol:N", title="Ticker"),
+                alt.Tooltip("company:N", title="Company"),
+                alt.Tooltip("sentiment:Q", title="Sentiment", format="+.3f"),
+                alt.Tooltip("contribution:Q", title="Contribution", format="+.4f"),
+                alt.Tooltip("supports_call:N", title="Supports call"),
+            ],
+        )
+        .properties(height=260, title=title)
+    )
+
+
 def _escape_markdown(text: str) -> str:
     """Escape characters that would break a Markdown link's display text.
 
@@ -237,7 +347,12 @@ def _format_headline_markdown(row: dict) -> str:
         bits.append(f"*{_escape_markdown(source)}*")
     symbol = (row.get("symbol") or "").strip()
     if symbol and symbol != "*":
-        bits.append(f"`{symbol}`")
+        company = (row.get("company") or "").strip()
+        if company and company != symbol:
+            # "Apple Inc. (`AAPL`)" — company name spelled out, ticker in code font.
+            bits.append(f"{_escape_markdown(company)} (`{symbol}`)")
+        else:
+            bits.append(f"`{symbol}`")
     published = row.get("published_at")
     if published is not None:
         bits.append(published.strftime("%Y-%m-%d %H:%M UTC"))
@@ -472,8 +587,9 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                 # when the per-prediction text gets long.
                 with st.container(height=480):
                     for i, p in enumerate(preds):
+                        long_name = expand_symbol(session, p.target_symbol)
                         st.markdown(
-                            f"### `{p.target_symbol}` — **{p.label}** "
+                            f"### {long_name} — **{p.label}** "
                             f"(confidence {p.confidence:.2f}, "
                             f"{p.article_count} article(s))"
                         )
@@ -481,16 +597,34 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                         if i < len(preds) - 1:
                             st.divider()
 
+            # --- Contribution chart (per-article, divergent bars) ----
+            market_contribs: list[ArticleContribution] = []
+            if market_pred is not None:
+                market_contribs = article_contributions(session, prediction=market_pred)
+
+            if market_contribs:
+                st.subheader("Per-article contribution chart")
+                st.caption(
+                    "One bar per article in today's window. Positive contributions "
+                    "extend above the 0-line, negative below. Bars are sorted "
+                    "left-to-right from most-negative to most-positive."
+                )
+                df = contribution_chart_data(market_contribs, session=session)
+                chart = build_contribution_chart(
+                    df,
+                    title=f"Contributions to {expand_symbol(session, market_pred.target_symbol)} call",
+                )
+                st.altair_chart(chart, use_container_width=True)
+
             # --- Recent headlines (sorted by contribution to the market call) ---
             st.subheader("Recent headlines")
             if market_pred is not None:
-                contribs = article_contributions(session, prediction=market_pred)
-                if contribs:
+                if market_contribs:
                     st.caption(
                         "Sorted by signed contribution to the Call. "
                         "🟢 = supports the Call, 🔴 = opposes."
                     )
-                    rows = headlines_from_contributions(contribs, limit=10)
+                    rows = headlines_from_contributions(market_contribs, limit=10)
                 else:
                     # Prediction exists but no scored articles — fall back to recency.
                     rows = recent_headlines(
@@ -498,6 +632,15 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                     )
             else:
                 rows = recent_headlines(session, limit=10)
+
+            # Expand each row's ticker → company name once, so the headline
+            # display can show "Apple Inc. (AAPL)" instead of just AAPL.
+            # expand_symbol_short strips any trailing " (SYM)" so we don't
+            # render "(XLK) (XLK)" for sector-ETF tickers.
+            for r in rows:
+                sym = (r.get("symbol") or "").strip()
+                if sym and sym != "*":
+                    r["company"] = expand_symbol_short(session, sym)
 
             if rows:
                 for row in rows:
