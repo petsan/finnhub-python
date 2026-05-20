@@ -46,6 +46,7 @@ from finn_predictor.storage.models import (
     SentimentScore,
 )
 from finn_predictor.storage.repo import all_sectors, predictions_for
+from finn_predictor.storage.stories import earliest_story_times
 from finn_predictor.storage.symbol_names import expand_symbol, expand_symbol_short
 
 
@@ -197,6 +198,31 @@ def prediction_history(
     )
 
 
+# Articles within this many seconds of the earliest cluster member are
+# considered "the same wire flash" — for those the UI suppresses a
+# separate "first reported" annotation because it would just echo the
+# article's own publish time.
+_FIRST_SEEN_DELTA_SECONDS = 300
+
+
+def attach_first_seen(
+    session: Session, rows: list[dict]
+) -> list[dict]:
+    """Mutate ``rows`` in place to add a ``first_seen_at`` datetime per row.
+
+    The value is the earliest published_at of any article with the same
+    :func:`finn_predictor.storage.stories.story_key`. ``None`` when no
+    match was found in the lookback window.
+    """
+    if not rows:
+        return rows
+    headlines = [r.get("headline", "") for r in rows]
+    earliest = earliest_story_times(session, headlines)
+    for r in rows:
+        r["first_seen_at"] = earliest.get(r.get("headline", ""))
+    return rows
+
+
 def contribution_chart_data(
     contributions: Sequence[ArticleContribution],
     *,
@@ -227,6 +253,8 @@ def contribution_chart_data(
                 "source",
                 "symbol",
                 "company",
+                "published_at",
+                "first_seen_at",
                 "direction",
                 "supports_call",
             ]
@@ -235,6 +263,16 @@ def contribution_chart_data(
     # Sort ascending by contribution so x-axis runs left=most-negative,
     # right=most-positive (matches the spec).
     ordered = sorted(contributions, key=lambda c: c.contribution)
+
+    # One-shot lookup of cluster-earliest timestamps for every headline in
+    # the dataset. We only run the query when a session is supplied —
+    # tests that pass session=None still get a usable frame.
+    first_seen_map: dict[str, datetime | None] = {}
+    if session is not None:
+        first_seen_map = earliest_story_times(
+            session, [c.article.headline for c in ordered]
+        )
+
     rows: list[dict[str, object]] = []
     for i, c in enumerate(ordered):
         if c.contribution > 0:
@@ -253,6 +291,8 @@ def contribution_chart_data(
                 "source": c.article.source or "",
                 "symbol": sym,
                 "company": expand_symbol(session, sym) if (session and sym) else "",
+                "published_at": c.article.published_at,
+                "first_seen_at": first_seen_map.get(c.article.headline),
                 "direction": direction,
                 "supports_call": c.supports_call,
             }
@@ -296,6 +336,8 @@ def build_contribution_chart(df: pd.DataFrame, *, title: str = "") -> alt.Chart:
                 alt.Tooltip("source:N", title="Source"),
                 alt.Tooltip("symbol:N", title="Ticker"),
                 alt.Tooltip("company:N", title="Company"),
+                alt.Tooltip("published_at:T", title="Published"),
+                alt.Tooltip("first_seen_at:T", title="First reported"),
                 alt.Tooltip("sentiment:Q", title="Sentiment", format="+.3f"),
                 alt.Tooltip("contribution:Q", title="Contribution", format="+.4f"),
                 alt.Tooltip("supports_call:N", title="Supports call"),
@@ -356,6 +398,23 @@ def _format_headline_markdown(row: dict) -> str:
     published = row.get("published_at")
     if published is not None:
         bits.append(published.strftime("%Y-%m-%d %H:%M UTC"))
+    first_seen = row.get("first_seen_at")
+    if first_seen is not None and published is not None:
+        # Only annotate when the story was reported earlier elsewhere by
+        # more than a wire-flash window — same-minute republishes would
+        # just clutter the line.
+        try:
+            delta = (published - first_seen).total_seconds()
+        except TypeError:
+            # Mixed naive/aware datetimes from SQLite roundtrip — coerce
+            # both to naive UTC for the diff.
+            p = published.replace(tzinfo=None) if published.tzinfo else published
+            f = first_seen.replace(tzinfo=None) if first_seen.tzinfo else first_seen
+            delta = (p - f).total_seconds()
+        if delta > _FIRST_SEEN_DELTA_SECONDS:
+            bits.append(
+                f"first reported {first_seen.strftime('%Y-%m-%d %H:%M UTC')}"
+            )
     sentiment = row.get("sentiment")
     # NaN sentiment shows as "—"; otherwise show signed score.
     if isinstance(sentiment, float) and sentiment == sentiment:  # NaN check
@@ -641,6 +700,9 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                 sym = (r.get("symbol") or "").strip()
                 if sym and sym != "*":
                     r["company"] = expand_symbol_short(session, sym)
+
+            # Attach the earliest "first reported" timestamp per headline.
+            attach_first_seen(session, rows)
 
             if rows:
                 for row in rows:

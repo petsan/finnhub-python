@@ -10,6 +10,7 @@ from finn_predictor.storage.models import (
     Sector,
     SentimentScore,
 )
+from finn_predictor.storage.stories import earliest_story_times, story_key
 from finn_predictor.storage.symbol_names import (
     WELL_KNOWN_NAMES,
     expand_symbol,
@@ -26,7 +27,9 @@ __all__ = [
     "SentimentScore",
     "WELL_KNOWN_NAMES",
     "create_engine_and_session",
+    "earliest_story_times",
     "expand_symbol",
     "expand_symbol_short",
     "init_db",
+    "story_key",
 ]

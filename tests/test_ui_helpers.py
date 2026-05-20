@@ -20,6 +20,7 @@ from finn_predictor.ui.app import (
     _escape_markdown,
     _format_headline_markdown,
     _parse_symbols,
+    attach_first_seen,
     build_contribution_chart,
     contribution_chart_data,
     headlines_from_contributions,
@@ -495,6 +496,126 @@ def test_format_headline_markdown_falls_back_when_no_company() -> None:
         }
     )
     assert "`ZZZ`" in line
+
+
+def test_format_headline_markdown_shows_first_reported_when_earlier() -> None:
+    """When the same story was reported elsewhere earlier, surface that ts."""
+    published = datetime(2026, 5, 19, 14, 30, tzinfo=timezone.utc)
+    first_seen = datetime(2026, 5, 19, 9, 0, tzinfo=timezone.utc)
+    line = _format_headline_markdown(
+        {
+            "headline": "h",
+            "url": "https://x/y",
+            "source": "",
+            "symbol": "*",
+            "published_at": published,
+            "first_seen_at": first_seen,
+            "sentiment": 0.5,
+        }
+    )
+    assert "first reported 2026-05-19 09:00 UTC" in line
+
+
+def test_format_headline_markdown_hides_first_reported_when_close() -> None:
+    """Same-minute republishes shouldn't add a redundant 'first reported' line."""
+    published = datetime(2026, 5, 19, 14, 30, tzinfo=timezone.utc)
+    first_seen = datetime(2026, 5, 19, 14, 31, tzinfo=timezone.utc)  # 1 min apart
+    line = _format_headline_markdown(
+        {
+            "headline": "h",
+            "url": "https://x/y",
+            "source": "",
+            "symbol": "*",
+            "published_at": published,
+            "first_seen_at": first_seen,
+            "sentiment": 0.5,
+        }
+    )
+    assert "first reported" not in line
+
+
+def test_format_headline_markdown_first_reported_handles_naive_datetime() -> None:
+    """SQLite roundtrip returns naive datetimes — formatter must cope."""
+    published = datetime(2026, 5, 19, 14, 30)  # naive
+    first_seen = datetime(2026, 5, 19, 9, 0)   # naive
+    line = _format_headline_markdown(
+        {
+            "headline": "h",
+            "url": "https://x/y",
+            "source": "",
+            "symbol": "*",
+            "published_at": published,
+            "first_seen_at": first_seen,
+            "sentiment": 0.5,
+        }
+    )
+    assert "first reported 2026-05-19 09:00 UTC" in line
+
+
+def test_attach_first_seen_populates_field(session) -> None:
+    """Plumbing test: attach_first_seen mutates rows in place."""
+    from finn_predictor.storage.repo import upsert_articles
+
+    early = make_article(
+        finnhub_id=1,
+        headline="Apple beats expectations",
+        published_at=D - timedelta(hours=5),
+    )
+    late = make_article(
+        finnhub_id=2,
+        headline="Apple beats expectations again",  # different story_key
+        published_at=D - timedelta(hours=1),
+    )
+    upsert_articles(session, [early, late])
+
+    rows = [
+        {"headline": "Apple beats expectations", "published_at": D},
+        {"headline": "Apple beats expectations again", "published_at": D},
+    ]
+    attach_first_seen(session, rows)
+    assert rows[0]["first_seen_at"] is not None
+    assert rows[1]["first_seen_at"] is not None
+
+
+def test_attach_first_seen_safe_on_empty_input(session) -> None:
+    assert attach_first_seen(session, []) == []
+
+
+def test_contribution_chart_data_includes_first_seen_field(session) -> None:
+    from finn_predictor.storage.repo import upsert_articles
+
+    earlier = make_article(
+        finnhub_id=1,
+        headline="Big news everyone",
+        published_at=D - timedelta(hours=5),
+    )
+    later = make_article(
+        finnhub_id=2,
+        headline="Big news everyone",
+        published_at=D,
+    )
+    upsert_articles(session, [earlier, later])
+    persisted = (
+        session.query(type(earlier))
+        .order_by(type(earlier).finnhub_id)
+        .all()
+    )
+
+    contribs = [
+        ArticleContribution(
+            article=persisted[1],
+            score=0.7,
+            weight=1.0,
+            contribution=0.3,
+            supports_call=True,
+        )
+    ]
+    df = contribution_chart_data(contribs, session=session)
+    assert "first_seen_at" in df.columns
+    fs = df.iloc[0]["first_seen_at"]
+    assert fs is not None
+    # The earliest of the cluster was the article persisted 5h earlier.
+    assert fs <= persisted[1].published_at
 
 
 def test_format_headline_markdown_handles_empty_headline() -> None:
