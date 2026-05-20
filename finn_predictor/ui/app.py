@@ -299,6 +299,58 @@ def headlines_from_contributions(
     return rows
 
 
+# Articles whose absolute VADER sentiment is at or below this threshold
+# are "neutral" — the model saw them but didn't extract enough polarity
+# to move the weighted index. Matches FLAT_SUPPORT_BAND in
+# predictor/explain.py: a contribution of that size doesn't tip a FLAT
+# call into UP or DOWN either, so the cutoff is internally consistent.
+NEUTRAL_SENTIMENT_THRESHOLD = 0.05
+
+
+def neutral_headlines_from_contributions(
+    contributions: Iterable[ArticleContribution],
+    *,
+    sentiment_threshold: float = NEUTRAL_SENTIMENT_THRESHOLD,
+    limit: int = 10,
+) -> list[dict]:
+    """Articles in the prediction's window that didn't move the needle.
+
+    Filters the contribution list down to rows whose absolute sentiment
+    score sits at or below ``sentiment_threshold`` — i.e. the scorer
+    saw them but rated them neutral. Sorted by published time
+    descending so the freshest neutral headlines surface first; the
+    main "Recent headlines" section already orders by
+    |contribution| desc, so this complement orders by recency.
+
+    The point is editorial: a market call backed by 30 scored articles
+    will typically have ~half scored neutrally. Hiding those entirely
+    overstates how decisive the model thought the day was. Surfacing
+    them in their own section keeps the reader honest about base
+    rates while keeping the headline contribution view free of noise.
+    """
+    threshold = abs(float(sentiment_threshold))
+    rows: list[dict] = []
+    for c in contributions:
+        if abs(c.score) > threshold:
+            continue
+        a = c.article
+        rows.append(
+            {
+                "published_at": a.published_at,
+                "headline": a.headline,
+                "source": a.source,
+                "symbol": a.symbol or "*",
+                "url": a.url or "",
+                "sentiment": c.score,
+            }
+        )
+    # Recency wins for the neutral pile — they have nothing else to
+    # rank by, and the user is most likely scanning for "did anything
+    # interesting happen that the model under-weighted."
+    rows.sort(key=lambda r: r["published_at"], reverse=True)
+    return rows[:limit]
+
+
 def recent_headlines(
     session: Session, *, limit: int = 10, model_version: str | None = None
 ) -> list[dict]:
@@ -1413,6 +1465,34 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
             else:
                 st.write("No headlines yet.")
 
+            # --- Neutral headlines (scored but ~zero, didn't move the index) ---
+            # These articles were in the prediction's window and got
+            # through the scorer, but the polarity score was at the
+            # noise floor (|score| ≤ NEUTRAL_SENTIMENT_THRESHOLD), so
+            # they contributed nothing material to the weighted mean.
+            # Surfacing them separately keeps the reader honest about
+            # how much of the day's news flow the model actually used
+            # versus shrugged at.
+            if market_pred is not None and market_contribs:
+                neutral_rows = neutral_headlines_from_contributions(
+                    market_contribs, limit=10
+                )
+                if neutral_rows:
+                    st.subheader("Neutral headlines")
+                    st.caption(
+                        f"In the prediction's window but with "
+                        f"|sentiment| ≤ {NEUTRAL_SENTIMENT_THRESHOLD} — "
+                        f"the scorer saw them but didn't extract enough "
+                        f"polarity to move the Call. Sorted by recency."
+                    )
+                    for r in neutral_rows:
+                        sym = (r.get("symbol") or "").strip()
+                        if sym and sym != "*":
+                            r["company"] = expand_symbol_short(session, sym)
+                    attach_first_seen(session, neutral_rows)
+                    for row in neutral_rows:
+                        st.markdown("- " + _format_headline_markdown(row))
+
         with tab_history:
             hist = prediction_history(session, target_symbol="^GSPC")
             if hist.empty:
@@ -1425,9 +1505,46 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                     )
 
         with tab_sectors:
-            grid = sector_grid(session, all_sectors(session))
+            sectors_present = all_sectors(session)
+            grid = sector_grid(session, sectors_present)
             if grid.empty:
-                st.write("Sectors not seeded yet — run an ingestion cycle.")
+                # Distinguish the three empty-state shapes so the user
+                # gets an actionable nudge instead of a wrong diagnosis.
+                if not sectors_present:
+                    st.write(
+                        "Sectors not seeded yet — run an ingestion cycle "
+                        "(the default 11 Sector SPDR ETFs are seeded on "
+                        "first ingest)."
+                    )
+                else:
+                    # Sectors ARE seeded; the predictions table is empty
+                    # because predict_all_sectors had no constituents to
+                    # aggregate. Two ways to get this populated.
+                    from finn_predictor.storage.repo import related_entities_for
+
+                    any_cached = any(
+                        related_entities_for(
+                            session, s.etf_symbol, relationship="ETF_HOLDING"
+                        )
+                        for s in sectors_present
+                    )
+                    if not any_cached:
+                        st.info(
+                            "**No sector predictions yet.** Sector "
+                            "aggregation needs cached constituents per ETF. "
+                            "Open the **Focus** tab → **Sector** mode → pick "
+                            "an ETF → click **Refresh constituents**. Then "
+                            "run ingestion again — each refreshed sector "
+                            "starts producing predictions on the next cycle."
+                        )
+                    else:
+                        st.info(
+                            "**No sector predictions yet.** Constituents "
+                            "are cached, but the per-constituent "
+                            "`company-news` feed has no articles in the "
+                            "current window. Run ingestion (or backfill) "
+                            "to populate `company`-category articles."
+                        )
             else:
                 st.dataframe(grid, use_container_width=True)
 

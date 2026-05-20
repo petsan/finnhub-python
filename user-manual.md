@@ -126,6 +126,14 @@ The headline view.
   opposes. The row also shows source, expanded company, published
   time, "first reported" timestamp if the same story appeared earlier
   elsewhere, sentiment score, and signed contribution.
+* **Neutral headlines** — articles in the prediction's window whose
+  sentiment score sits at or below `|0.05|`. The scorer saw them but
+  didn't extract enough polarity to move the Call; they're sorted by
+  recency rather than contribution magnitude (which would be
+  meaningless — they all sit at the noise floor). Surfacing them
+  keeps the picture honest about how much of the day's news flow the
+  model actively used versus shrugged at. Hidden when there are no
+  neutral articles in the window.
 
 ### 3.2 History
 
@@ -429,6 +437,23 @@ Your key isn't permitted on the `/news` endpoint. Check
 <https://finnhub.io/dashboard> — recently rotated key on a free-tier
 account is the usual cause. Free tier *does* normally include `/news`;
 if it doesn't, raise a support ticket with Finnhub.
+
+### Sectors tab shows "No sector predictions yet"
+
+Two shapes of this empty state, both surfaced as Streamlit info
+boxes:
+
+* *"Sector aggregation needs cached constituents per ETF..."* — the
+  fix is to open the **Focus** tab, pick **Sector** mode, choose an
+  ETF, and click **Refresh constituents**. That populates
+  `RelatedEntity(ETF_HOLDING)` rows for that sector via Finnhub's
+  `/etf/holdings` endpoint. Then on the next ingestion run the
+  sector's `predict_sector` finds tickers to aggregate.
+* *"Constituents are cached, but the per-constituent company-news
+  feed has no articles..."* — the cache is there but no
+  `company`-category articles exist for those constituents in the
+  current window. Re-running ingestion (or backfill) populates the
+  feed.
 
 ### Sidebar shows green "Done — articles +0"
 

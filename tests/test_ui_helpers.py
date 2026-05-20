@@ -17,6 +17,7 @@ from finn_predictor.storage.repo import (
 )
 from finn_predictor.predictor.explain import ArticleContribution
 from finn_predictor.ui.app import (
+    NEUTRAL_SENTIMENT_THRESHOLD,
     _escape_markdown,
     _format_headline_markdown,
     _parse_symbols,
@@ -31,6 +32,7 @@ from finn_predictor.ui.app import (
     headlines_from_contributions,
     latest_market_prediction,
     latest_predictions,
+    neutral_headlines_from_contributions,
     partition_predictions,
     prediction_history,
     recent_headlines,
@@ -1086,6 +1088,97 @@ def test_format_expected_move_returns_none_when_columns_missing() -> None:
     p.expected_return_p10 = -0.01
     p.expected_return_p90 = 0.01
     assert format_expected_move(p) is None  # p50 missing
+
+
+def _make_contribution(headline: str, score: float, *, published_at=None, source="Reuters", symbol=None, url=""):
+    """Build an ArticleContribution from the bare minimums needed by the UI helpers."""
+    from finn_predictor.predictor.explain import ArticleContribution
+    from finn_predictor.storage.models import NewsArticle
+
+    art = NewsArticle(
+        finnhub_id=hash(headline) % 1_000_000_000,
+        category="general",
+        headline=headline,
+        summary="",
+        source=source,
+        url=url,
+        symbol=symbol,
+        published_at=published_at or D,
+    )
+    # weight + contribution placeholders — the neutral filter looks at .score
+    return ArticleContribution(
+        article=art, score=score, weight=1.0,
+        contribution=score / 10.0, supports_call=False,
+    )
+
+
+def test_neutral_headlines_filter_returns_only_low_score_rows() -> None:
+    """Only articles with |score| ≤ threshold show up."""
+    contribs = [
+        _make_contribution("Big rally", 0.9),
+        _make_contribution("Sky stayed blue", 0.0),
+        _make_contribution("Earnings report filed", 0.02),
+        _make_contribution("Disaster strikes", -0.85),
+        _make_contribution("Marginal note", -0.04),
+    ]
+    out = neutral_headlines_from_contributions(contribs)
+    headlines = {r["headline"] for r in out}
+    assert headlines == {"Sky stayed blue", "Earnings report filed", "Marginal note"}
+    # And no contribution field is leaked — the row dict is intentionally
+    # missing it (the formatter then skips the "contrib …" suffix).
+    assert all("contribution" not in r for r in out)
+
+
+def test_neutral_headlines_sorted_by_recency() -> None:
+    """Neutral pile orders newest → oldest, opposite of |contribution|."""
+    older = datetime(2026, 5, 18, 6, tzinfo=timezone.utc)
+    newer = datetime(2026, 5, 19, 9, tzinfo=timezone.utc)
+    newest = datetime(2026, 5, 19, 16, tzinfo=timezone.utc)
+    contribs = [
+        _make_contribution("Old neutral", 0.01, published_at=older),
+        _make_contribution("Newest neutral", -0.03, published_at=newest),
+        _make_contribution("Mid neutral", 0.0, published_at=newer),
+    ]
+    out = neutral_headlines_from_contributions(contribs)
+    assert [r["headline"] for r in out] == [
+        "Newest neutral", "Mid neutral", "Old neutral",
+    ]
+
+
+def test_neutral_headlines_honours_limit() -> None:
+    contribs = [_make_contribution(f"Neutral {i}", 0.01) for i in range(15)]
+    out = neutral_headlines_from_contributions(contribs, limit=4)
+    assert len(out) == 4
+
+
+def test_neutral_headlines_respects_explicit_threshold() -> None:
+    """A bigger threshold lets through articles the default would exclude."""
+    contribs = [
+        _make_contribution("Mild positive", 0.15),
+        _make_contribution("Truly neutral", 0.02),
+        _make_contribution("Mild negative", -0.10),
+    ]
+    out = neutral_headlines_from_contributions(contribs, sentiment_threshold=0.2)
+    assert {r["headline"] for r in out} == {
+        "Mild positive", "Truly neutral", "Mild negative",
+    }
+
+
+def test_neutral_headlines_empty_input() -> None:
+    assert neutral_headlines_from_contributions([]) == []
+
+
+def test_neutral_sentiment_threshold_matches_explain_flat_band() -> None:
+    """The neutral cutoff stays in lockstep with explain.FLAT_SUPPORT_BAND.
+
+    Both knobs encode the same notion: a single article whose
+    contribution sits at or under this magnitude doesn't tip a FLAT
+    call. Drifting them apart would create the UX bug where an
+    article shows up in the neutral pile while also being treated as
+    a directional supporter elsewhere.
+    """
+    from finn_predictor.predictor.explain import FLAT_SUPPORT_BAND
+    assert NEUTRAL_SENTIMENT_THRESHOLD == FLAT_SUPPORT_BAND
 
 
 def test_format_expected_move_handles_negative_band() -> None:
