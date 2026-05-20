@@ -56,13 +56,24 @@ def predict_market(
     symbol: str = "^GSPC",
     category: Optional[str] = "general",
     article_symbol: Optional[str] = None,
+    threshold_sigma: Optional[float] = None,
+    min_baseline_sigma: Optional[float] = None,
 ) -> Optional[Prediction]:
     """Compute and persist a whole-market prediction for ``on_date``.
+
+    ``threshold_sigma`` and ``min_baseline_sigma`` default to the
+    module-level constants but can be overridden — the learning loop
+    sweeps over them and the live caller can read them from
+    :func:`finn_predictor.learning.active_weights`.
 
     Returns the saved :class:`Prediction` (or ``None`` if there's not enough
     data even to call FLAT — i.e. zero articles).
     """
     on_date = on_date or datetime.now(timezone.utc)
+    threshold = threshold_sigma if threshold_sigma is not None else THRESHOLD_SIGMA
+    floor = (
+        min_baseline_sigma if min_baseline_sigma is not None else MIN_BASELINE_SIGMA
+    )
 
     today = daily_sentiment_index(
         session,
@@ -82,13 +93,13 @@ def predict_market(
         category=category,
         symbol=article_symbol,
     )
-    sigma = max(base.stddev, MIN_BASELINE_SIGMA)
+    sigma = max(base.stddev, floor)
     z = (today.weighted_mean - base.mean) / sigma
 
     if today.count < MIN_ARTICLES_FOR_CALL:
         label, confidence = "FLAT", 0.0
     else:
-        label, confidence = classify(z)
+        label, confidence = classify(z, threshold=threshold)
 
     # Normalise to start-of-UTC-day so two runs on the same calendar day
     # collide on save_prediction's unique key and upsert the same row.

@@ -3,6 +3,7 @@
 from finn_predictor.storage.engine import create_engine_and_session, init_db
 from finn_predictor.storage.models import (
     Base,
+    LearnedWeight,
     NewsArticle,
     PriceBar,
     Prediction,
@@ -20,6 +21,7 @@ from finn_predictor.storage.symbol_names import (
 
 __all__ = [
     "Base",
+    "LearnedWeight",
     "NewsArticle",
     "PriceBar",
     "Prediction",

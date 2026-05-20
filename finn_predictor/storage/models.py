@@ -165,6 +165,42 @@ class Prediction(Base):
     )
 
 
+class LearnedWeight(Base):
+    """One row per (version, dimension, key) learned during a training run.
+
+    A "version" is the unit of weight activation — exactly one version is
+    ``is_active = True`` at any time, and we never mutate historical
+    versions so old predictions remain reproducible by referencing the
+    version that generated them.
+
+    ``dimension`` ∈ {``THRESHOLD_SIGMA``, ``MIN_BASELINE_SIGMA``,
+    ``HALF_LIFE_HOURS``, ``SOURCE_WEIGHT``}. ``key`` is None for the
+    scalar dimensions and the source name (e.g. ``"Reuters"``) for
+    SOURCE_WEIGHT rows.
+    """
+
+    __tablename__ = "learned_weights"
+    __table_args__ = (
+        UniqueConstraint(
+            "version", "dimension", "key", name="uq_learned_weights"
+        ),
+        Index("ix_learned_weights_version", "version"),
+        Index("ix_learned_weights_active", "is_active"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    dimension: Mapped[str] = mapped_column(String(32), nullable=False)
+    key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    value: Mapped[float] = mapped_column(Float, nullable=False)
+    fitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    training_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    holdout_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    is_active: Mapped[bool] = mapped_column(nullable=False, default=False)
+
+
 class RelatedEntity(Base):
     """Cached relationship from a ticker to another entity.
 

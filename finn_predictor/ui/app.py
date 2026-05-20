@@ -55,6 +55,23 @@ from finn_predictor.predictor.focus import (
     refresh_company_relationships,
     refresh_sector_constituents,
 )
+from finn_predictor.learning import (
+    LearnedConfig,
+    TrainingReport,
+    active_weights,
+    train_weights,
+)
+from finn_predictor.learning.config import (
+    DIM_HALF_LIFE,
+    DIM_MIN_SIGMA,
+    DIM_SOURCE_WEIGHT,
+    DIM_THRESHOLD,
+)
+from finn_predictor.learning.train import (
+    MIN_TRADES_FOR_TRAINING,
+    NotEnoughDataError,
+)
+from finn_predictor.storage.models import LearnedWeight
 from finn_predictor.predictor.stocks import retroactive_predict_many
 from finn_predictor.predictor.trades import (
     PerformanceSummary,
@@ -1147,8 +1164,9 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
             tab_sectors,
             tab_performance,
             tab_focus,
+            tab_learning,
         ) = st.tabs(
-            ["Today", "History", "Sectors", "Performance", "Focus"]
+            ["Today", "History", "Sectors", "Performance", "Focus", "Learning"]
         )
 
         with tab_today:
@@ -1586,6 +1604,9 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                 else:
                     st.info("Type a query to search.")
 
+        with tab_learning:
+            _render_learning_tab_wrapped(session)
+
 
 def _render_related_grid(
     session: Session,
@@ -1771,6 +1792,163 @@ def _render_event_focus(
             st.markdown("- " + _format_headline_markdown(row))
     else:
         st.write("No matches.")
+
+
+# --- Learning tab ----------------------------------------------------
+
+
+def _render_learning_tab(session: Session) -> None:  # pragma: no cover
+    """Self-improvement: train new weights from the trade ledger."""
+    st.caption(
+        "Train new weights from the hypothetical-trade ledger. The "
+        "objective is `hit_rate + 0.5 × cumulative_PnL` over a "
+        "time-split training window; the holdout is the last 14 days. "
+        "After training the new version is **auto-activated** "
+        "(newest wins). Older versions stay in the table so you can "
+        "inspect them."
+    )
+
+    cfg = active_weights(session)
+    st.subheader("Active weights")
+    cols = st.columns(4)
+    cols[0].metric(
+        "Version", str(cfg.version) if cfg.version is not None else "defaults",
+    )
+    cols[1].metric("Threshold σ", f"{cfg.threshold_sigma:.3f}")
+    cols[2].metric("Min baseline σ", f"{cfg.min_baseline_sigma:.3f}")
+    cols[3].metric("Half-life (h)", f"{cfg.half_life_hours:.2f}")
+
+    if cfg.source_weights:
+        with st.expander(
+            f"Source weights ({len(cfg.source_weights)} sources)",
+            expanded=False,
+        ):
+            df = pd.DataFrame(
+                [
+                    {"Source": k, "Weight": v}
+                    for k, v in sorted(
+                        cfg.source_weights.items(),
+                        key=lambda kv: -kv[1],
+                    )
+                ]
+            )
+            st.dataframe(
+                df, use_container_width=True, hide_index=True,
+                column_config={
+                    "Weight": st.column_config.NumberColumn(
+                        "Weight", format="%.3f",
+                    ),
+                },
+            )
+
+    st.subheader("Train a new version")
+    n_calls = st.slider(
+        "Bayesian-optimisation iterations",
+        min_value=10, max_value=80, value=30, step=5,
+        help="More iterations = better optima but longer training. "
+             "30 finishes in seconds on hundreds of trades.",
+    )
+    train_clicked = st.button("Retrain now")
+
+    if train_clicked:
+        with st.spinner(
+            f"Training: {n_calls} Bayesian-optimisation iterations…"
+        ):
+            try:
+                report: TrainingReport = train_weights(
+                    session, n_calls=n_calls
+                )
+            except NotEnoughDataError as exc:
+                st.warning(
+                    f"Not enough closed predictions to train ({exc}). "
+                    f"Need at least {MIN_TRADES_FOR_TRAINING} closed "
+                    "trades — run more ingestion + price backfill first."
+                )
+                report = None
+            except Exception as exc:
+                st.error(f"Training failed: {exc}")
+                report = None
+
+        if report is not None:
+            st.success(
+                f"Trained version {report.version} "
+                f"(train n={report.n_train}, holdout n={report.n_holdout})"
+            )
+            cols = st.columns(2)
+            cols[0].metric(
+                "Training score",
+                f"{report.training_score:+.4f}",
+                delta=f"{report.training_score - report.baseline_training_score:+.4f} vs. baseline",
+            )
+            if report.holdout_score is not None:
+                delta = (
+                    f"{report.holdout_score - (report.baseline_holdout_score or 0.0):+.4f} vs. baseline"
+                    if report.baseline_holdout_score is not None
+                    else None
+                )
+                cols[1].metric(
+                    "Holdout score",
+                    f"{report.holdout_score:+.4f}",
+                    delta=delta,
+                )
+            else:
+                cols[1].metric("Holdout score", "—")
+            st.json(
+                {
+                    "fitted": report.fitted,
+                    "source_weight_count": len(report.source_weights),
+                }
+            )
+
+    # History of versions.
+    st.subheader("Version history")
+    hist_rows = list(
+        session.scalars(
+            select(LearnedWeight)
+            .where(LearnedWeight.dimension == DIM_THRESHOLD)
+            .order_by(LearnedWeight.version.desc())
+        )
+    )
+    if not hist_rows:
+        st.caption("No trained versions yet.")
+    else:
+        hist_df = pd.DataFrame(
+            [
+                {
+                    "Version": r.version,
+                    "Active": "✓" if r.is_active else "",
+                    "Threshold σ": float(r.value),
+                    "Training score": r.training_score,
+                    "Holdout score": r.holdout_score,
+                    "Fitted at": r.fitted_at,
+                }
+                for r in hist_rows
+            ]
+        )
+        st.dataframe(
+            hist_df, use_container_width=True, hide_index=True,
+            column_config={
+                "Training score": st.column_config.NumberColumn(
+                    "Training score", format="%+.4f",
+                ),
+                "Holdout score": st.column_config.NumberColumn(
+                    "Holdout score", format="%+.4f",
+                ),
+            },
+        )
+
+
+def _render_learning_tab_wrapped(session: Session) -> None:
+    """Outer wrapper so import-time failures don't crash the tab."""
+    try:
+        _render_learning_tab(session)
+    except Exception as exc:  # pragma: no cover - last-resort UI guard
+        st.error(f"Learning tab error: {exc}")
+
+
+# Install the tab body via a small monkey-patch into main(): we already
+# referenced ``tab_learning`` in the st.tabs(...) call above, so we just
+# need to render its body when the tab is selected.
 
 
 if __name__ == "__main__":  # pragma: no cover

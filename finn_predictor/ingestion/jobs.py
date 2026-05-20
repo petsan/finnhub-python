@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from finn_predictor.ingestion.client import FinnhubGateway, IngestionError
 from finn_predictor.ingestion.news import ingest_company_news, ingest_general_news
 from finn_predictor.ingestion.prices import ingest_price_history
+from finn_predictor.learning.config import active_weights
 from finn_predictor.predictor.market import predict_market
 from finn_predictor.predictor.sectors import predict_all_sectors
 from finn_predictor.predictor.stocks import predict_all_stocks
@@ -134,7 +135,14 @@ def run_daily_ingest(
     # left over from a previous successful ingestion.
     counts["scored"] = score_pending_articles(session, scorer)
 
-    market_pred = predict_market(session, scorer=scorer, on_date=today, symbol=market_symbol)
+    # Load active learned weights once and pass through to every predictor.
+    weights = active_weights(session)
+
+    market_pred = predict_market(
+        session, scorer=scorer, on_date=today, symbol=market_symbol,
+        threshold_sigma=weights.threshold_sigma,
+        min_baseline_sigma=weights.min_baseline_sigma,
+    )
     if market_pred is not None:
         counts["predictions"] = int(counts["predictions"]) + 1
 
