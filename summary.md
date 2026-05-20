@@ -24,36 +24,51 @@ branch; left the upstream library untouched.
   walks each historical UTC day to populate the prediction history and the
   rolling baseline.
 
-## Architecture (three layers, plus cross-cutting)
+## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Layer 1 — Web UI (Streamlit)                            │
-│    Today  · per-stock table · contribution chart ·       │
-│    "Why this Call?" 5-¶ explanation · linked headlines   │
-│    History · Sectors                                     │
-│    Sidebar: session-only API key, daily ingest button,   │
-│             "Backfill historical news" with lookback     │
-└──────────────▲────────────────────────────────────▲──────┘
-               │ reads only                          │ reads
-┌──────────────┴────────────────────┐  ┌────────────┴──────┐
-│  Layer 3 — Recommendation engine  │  │  Backtester       │
-│    z-score classifier             │  │    pairs each pred│
-│    market / sector / stock        │  │    with realised  │
-│    retroactive replay             │  │    next-bar return│
-└──────────────▲────────────────────┘  └─────────▲─────────┘
-               │ reads/writes                    │
-┌──────────────┴─────────────────────────────────┴─────────┐
-│  Layer 2 — Storage (SQLite via SQLAlchemy)               │
-│    news_articles · sentiment_scores · price_bars ·       │
-│    predictions · prediction_outcomes · sectors           │
-└──────────────▲───────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│  Layer 1 — Web UI (Streamlit)                                      │
+│    Today      · per-stock table · contribution chart · 5-¶         │
+│               "Why this Call?" · linked headlines                  │
+│    History    · prediction timeline                                │
+│    Sectors    · per-sector grid                                    │
+│    Performance · hit-rate + cumulative PnL charts + trade ledger   │
+│    Focus      · Company / Sector / Event drill-downs               │
+│    Learning   · activation policy + holdout gate + Bayesian        │
+│               retrain + version history                            │
+│    Sidebar    · session-only API key (optional bcrypt password    │
+│               gate around the whole UI) · daily-ingest +          │
+│               historical-news + yfinance-prices backfills          │
+└──────────────▲──────────────────────────▲──────────────────▲──────┘
+               │ reads only                │ reads             │ writes
+┌──────────────┴────────┐  ┌───────────────┴─────────┐  ┌─────┴─────────────────┐
+│  Recommendation       │  │  Backtester             │  │  Self-improvement     │
+│  engine               │  │    pairs each pred with │  │    Bayesian opt over  │
+│    z-score classifier │  │    realised next-bar    │  │    threshold / σ floor│
+│    market / sector /  │  │    return; signs PnL by │  │    / half-life /      │
+│    stock              │  │    Call direction       │  │    per-source weights │
+│    explanation block  │  │                         │  │    versioned active   │
+│    focus composer     │  │                         │  │    set in DB          │
+│    retroactive replay │  │                         │  │    holdout gate       │
+└──────────────▲────────┘  └─────────────▲───────────┘  └─────────▲─────────────┘
+               │                          │                         │
+┌──────────────┴──────────────────────────┴─────────────────────────┴───────────┐
+│  Layer 2 — Storage (SQLAlchemy; SQLite by default, PostgreSQL supported)      │
+│    news_articles · sentiment_scores · price_bars · predictions ·              │
+│    prediction_outcomes · sectors · related_entities · learned_weights ·       │
+│    app_settings                                                               │
+└──────────────▲────────────────────────────────────────────────────────────────┘
                │ writes
-┌──────────────┴───────────────────────────────────────────┐
-│  Ingestion (FinnhubGateway → finnhub.Client)             │
-│    daily ingest · historical backfill · rate-limit       │
-│    + retry + token scrubbing + proxy bypass              │
-└──────────────────────────────────────────────────────────┘
+┌──────────────┴────────────────────────────────────────────────────────────────┐
+│  Ingestion                                                                    │
+│    FinnhubGateway → finnhub.Client                                            │
+│      news (general + per-company) · per-target-and-sector-ETF candles ·       │
+│      peers · supply chain · ETF holdings · profile2                           │
+│    yfinance (no key required) → daily OHLC for every prediction target        │
+│    Three-layer API-token scrubbing · proxy bypass · per-endpoint failure      │
+│    isolation · rate-limit + retry                                             │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Quickstart
@@ -100,7 +115,7 @@ of up to a year.
 | Feature | Notes |
 |---|---|
 | Session-only API key | Masked input, lives in server memory, cleared on tab close. |
-| Triple-layer key scrubbing | Errors (including `requests.SSLError` URL leaks) get `<REDACTED>` before display, logging, or persistence. Defence-in-depth at gateway, helper, and UI display layers. |
+| Triple-layer key scrubbing | Errors (including `requests.SSLError` URL leaks) get `<REDACTED>` before display, logging, or persistence. Defence-in-depth at gateway, helper, and UI display layers. A regex-based `SecretScrubFilter` on every logging handler is the fourth safety net. |
 | HTTPS_PROXY bypass | The ingestion client sets `trust_env=False` so a dev proxy (Burp / mitmproxy) doesn't break TLS verification. |
 | Resilient ingest | A 403 on `/stock/candle` doesn't abort the run; `/news` still ingests. Per-op failures surface in a collapsed expander. |
 | News-feed empty vs. failed | Sidebar distinguishes "`/news` 403 — key/plan issue" from "`/news` returned 0 today, candles gated as usual". |
@@ -109,7 +124,17 @@ of up to a year.
 | Per-article contribution chart | Divergent vertical Altair bars: x-axis sorted -1→0→+1 by signed contribution, y-axis is signed contribution centered on a 0-line. Tooltip includes headline, source, ticker, expanded company name, published, first-reported, sentiment, contribution, supports-call. |
 | Story clustering | Each article's "first reported" timestamp comes from the earliest member of its story cluster (prefix-matched `story_key`), with a 5-minute wire-flash window to suppress same-minute republishes from cluttering the line. |
 | Predictions deduped | `prediction_date` normalised to start-of-UTC-day so multiple ingests on the same day upsert one row. One-shot migration cleans up older duplicates. |
-| Historical backfill | Pages `/company-news` in 30-day chunks per ticker, dedupes against the DB, scores new articles, then writes one Prediction per UTC day in the window. Builds up the rolling baseline immediately. |
+| Historical news backfill | Pages `/company-news` in 30-day chunks per ticker, dedupes against the DB, scores new articles, then writes one Prediction per UTC day in the window. Builds up the rolling baseline immediately. |
+| yfinance price backfill | Pulls daily OHLC for every prediction target — fills the gap left by Finnhub's gated `/stock/candle`. No API key needed. Runs the backtester after, closing newly-paired predictions. |
+| Performance tab | 5 summary metrics, 4 Altair charts (cumulative PnL · rolling 14-trade hit-rate with 50% reference line · hit-rate by target kind · hit-rate by Call), sortable trade ledger. |
+| Focus tab | Three modes — Company (subject + peers + supply chain + recent articles), Sector (ETF + cached constituents), Event (free-text news search with implied Call). |
+| Self-improvement | Bayesian-optimisation retrain over `threshold_sigma`, `min_baseline_sigma`, `half_life_hours`, plus closed-form per-source weights. All four knobs applied at **live** scoring time (not just inside the simulator). Versioned `LearnedWeight` rows; old versions kept for revert. |
+| Activation policy | `AUTO` (newest version wins) or `MANUAL` (user clicks Activate). Persisted across Streamlit restarts via an `app_settings` table. |
+| Holdout-improvement gate | Under AUTO policy, refuses to activate a new version whose holdout score drops by more than the configured tolerance vs. the live config. UI shows the gap + an "Activate anyway" override. |
+| Auth gate | Optional bcrypt password gate around the entire UI. Generate the hash via `python -m finn_predictor.cli hash-password`, set `FINN_PREDICTOR_PASSWORD_HASH`. Unset → no auth (safe default for localhost). |
+| Postgres support | Set `FINN_PREDICTOR_DB_URL="postgresql+psycopg://..."` — the upserts are dialect-aware. `psycopg[binary]` ships in default requirements. |
+| Structured logging | `FINN_PREDICTOR_LOG_FORMAT=json` switches to one-record-per-line JSON output suitable for log aggregators. |
+| Docker | `docker compose up --build` builds and starts the app on host 8501. Named volume keeps the SQLite DB across `down`. `RESET_DB=1` wipes on next start. `docker compose run --rm app ingest|retrain|reset-db|shell|hash-password` for headless ops. Runs as non-root. |
 
 ## Limitations
 
@@ -127,11 +152,13 @@ of up to a year.
 
 ## Test posture
 
-Every external HTTP call goes through `FinnhubGateway`, which is mocked
-in tests — **no test makes a real Finnhub call**. SQLite-backed tests run
-against `:memory:` per-test, giving fast and isolated coverage. As of the
-latest commit: **213 tests passing at 98% line+branch coverage** across the
+Every external HTTP call goes through `FinnhubGateway` (Finnhub) or an
+injectable `history_fn` (yfinance), both mocked in tests — **no test
+makes a real network call**. SQLite-backed tests run against `:memory:`
+per-test, giving fast and isolated coverage. As of the latest commit:
+**337 tests passing at 95% line+branch coverage** across the
 `finn_predictor` package.
 
-See `progress.md` for the design doc and `diff.md` for the per-commit
-change log.
+See `progress.md` for the design doc, `diff.md` for the per-commit
+change log, `user-manual.md` for how to drive the dashboard, and
+`installation-manual.md` for how to install / deploy / harden it.

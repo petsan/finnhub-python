@@ -5,8 +5,8 @@ chronological (oldest → newest) order. The upstream `finnhub-python`
 library itself (`finnhub/`, `setup.py`, etc.) is **untouched**; everything
 new lives under `finn_predictor/`, `tests/`, and a few config files.
 
-Totals across the branch: **49 files changed, ~7,790 insertions(+),
-1 deletion(-)** vs. `master` (commit `c94e7d4 release 2.4.28`).
+Totals across the branch: **75 files changed, ~15,800 insertions(+),
+3 deletions(-)** vs. `master` (commit `c94e7d4 release 2.4.28`).
 
 ---
 
@@ -273,6 +273,237 @@ UI:
 
 213 tests passing at 98% coverage by this commit.
 
+## c6949c7 — predictor+ui: hypothetical trades + Performance tab
+
+*8 files, +1547 / −2*
+
+Three new layers stacked together so we can measure how often the
+predictor is right.
+
+New module `finn_predictor/ingestion/prices_yf.py`: yfinance-backed
+daily-OHLC ingestion. Fills the gap left by Finnhub's gated
+`/stock/candle` — no API key needed; writes to the same `PriceBar`
+table the rest of the backtester reads. Per-symbol failures isolated.
+
+New module `finn_predictor/predictor/trades.py`: `TradeRecord` dataclass
+derived from each `Prediction` + its `PredictionOutcome` (UP → long
+at prediction-day close, DOWN → short, FLAT → no trade; exit at next
+session close). Aggregate helpers: `cumulative_pnl_series`,
+`rolling_hit_rate`, `hit_rate_by_target_kind`, `hit_rate_by_label`,
+`performance_summary`. All pure functions; no schema change.
+
+UI: fourth tab **Performance** with 5 summary metrics, 4 Altair charts
+(cumulative PnL, rolling 14-trade hit-rate with 50% reference rule,
+hit-rate by target kind, hit-rate by Call), and a sortable trade
+ledger. Sidebar gains *Backfill prices (yfinance)* — collects every
+prediction target in the DB, pulls OHLC, then runs `score_outcomes()`
+to close any newly-paired predictions.
+
+## 290f387 — predictor+ui: Focus tab — company / sector / event drill-downs
+
+*8 files, +1528 / −2*
+
+New entity graph + a fifth tab.
+
+Schema: `RelatedEntity` (source_symbol, related_symbol, relationship
+∈ {PEER, SUPPLIER, CUSTOMER, ETF_HOLDING}, rank, metadata_text,
+fetched_at) with `storage/repo.upsert_related_entity` /
+`related_entities_for`.
+
+Gateway: `company_peers`, `company_profile2`, `stock_supply_chain`,
+`etfs_holdings` added to `FinnhubGateway`.
+
+New module `finn_predictor/predictor/focus.py`:
+* `compose_company_focus(symbol)` → CompanyFocus (own prediction +
+  peers' predictions + supply chain when the plan supports it +
+  recent articles spanning the subject and its peers).
+* `compose_sector_focus(sector_code)` → SectorFocus (ETF's prediction
+  + cached top constituents).
+* `compose_event_focus(query, lookback_days)` → EventFocus (free-text
+  search across headline + summary, per-ticker breakdown, implied
+  Call via sign-of-mean classifier with ±0.1 dead-band).
+* `refresh_company_relationships` and `refresh_sector_constituents`
+  pull from Finnhub and persist via the new repo.
+
+UI: fifth tab **Focus** with mode picker (Company / Sector / Event)
+and per-mode renderers. Each renders the subject's metrics, related-
+entities grids (with company-name expansion + ProgressColumn for
+confidence), and the existing linked-headline list.
+
+## dd9790d — learning: train + apply weights from hypothetical-trade outcomes
+
+*10 files, +1422 / −4*
+
+Self-improvement layer.
+
+Schema: `LearnedWeight` (version, dimension, key, value, fitted_at,
+training_score, holdout_score, is_active). Exactly one version is
+active; old versions stay for inspection / revert.
+
+New package `finn_predictor/learning/`:
+* `config.py` — LearnedConfig dataclass + `active_weights(session)` +
+  `weights_for_version`. Falls back to hand-tuned constants when no
+  version is active.
+* `simulate.py` — `build_training_frame` loads articles + scores +
+  outcomes once; `simulate(frame, config)` replays the predictor
+  pipeline (recency-weighted aggregate → rolling baseline → z-score
+  → classify with the candidate's threshold) for every closed
+  prediction. `blended_objective = hit_rate + 0.5 × cum_pnl`.
+* `train.py` — `train_weights(session, n_calls=30)` time-splits the
+  frame (last 14 days = holdout), fits per-source weights via a
+  closed-form hit-rate-ratio pass, then runs skopt's `gp_minimize`
+  over (threshold_sigma, min_baseline_sigma, half_life_hours).
+  Persists a new LearnedWeight version + auto-activates.
+
+`predict_market` gains `threshold_sigma` + `min_baseline_sigma`
+overrides. Daily ingest reads `active_weights(session)` and passes
+them through. UI: sixth tab **Learning** with current weights +
+*Retrain now* button + Bayesian-iteration slider + version history.
+
+New dep: scikit-optimize 0.10.2 (lazy-imported).
+
+## c48b339 — learning: toggle between auto-activate and manual approval
+
+*7 files, +319 / −7*
+
+Cross-session app_settings table backs an `activation_policy`
+preference (AUTO ⇔ MANUAL). UI radio in the Learning tab; `train_weights`
+consults it via a new sentinel default `activate=None`.
+
+Schema: `AppSetting` (key, value, updated_at) — tiny key/value table
+for cross-session UI preferences. Survives Streamlit restarts.
+
+Repo: `get_setting` / `set_setting` (generic), plus typed
+`get_activation_policy` / `set_activation_policy` (defaults AUTO;
+junk values coerce back to AUTO). New `activate_learned_version`
+flips `is_active` flags atomically.
+
+UI: radio under active-weights ("Auto-activate — newest wins" vs.
+"Manual approval — leave new version inactive; you click Activate").
+Each inactive version in the history table gets an "Activate v\<n\>"
+button. Max 4 buttons rendered to avoid layout blow-up.
+
+## dcef051 — learning + docker: holdout gate + container deploy
+
+*12 files, +776 / −8*
+
+Holdout-improvement gate + Docker stack.
+
+Holdout gate: new `holdout_tolerance` setting (default 0.01). Under
+AUTO policy, `train_weights` re-scores the currently-active config on
+the same holdout window via `blended_objective`; if the candidate
+scores worse than `(active - tolerance)`, save the version but leave
+inactive and report the gap. `TrainingReport` carries `activated`,
+`gate_blocked`, `gate_reason`, `active_holdout_score_at_decision`,
+`holdout_tolerance` so the UI can explain what happened. Explicit
+`activate=True` still bypasses the gate.
+
+New CLI module `finn_predictor/cli.py` with `serve` / `reset-db
+[--yes]` / `retrain [--n-calls N] [--activate auto|yes|no]`.
+Argparse-driven; exit codes 0/2/3.
+
+Docker: Dockerfile (python:3.12-slim + build-essential), docker-
+compose.yml (single `app` service, `finn_data` named volume,
+healthcheck), docker/entrypoint.sh (routes serve|reset-db|retrain|
+shell + RESET_DB env), requirements.txt (every app dep pinned to a
+lower bound), .dockerignore.
+
+UI: Learning tab gains tolerance slider, three-state post-training
+feedback (Activated / Saved-not-active / Gate-blocked) with
+"Activate v\<n\> anyway" override button.
+
+## c8e6314 — docs: add user-manual.md and installation-manual.md
+
+*2 files, +796 / −0*
+
+Two long-form guides separating "how do I use the dashboard?" from
+"how do I install / deploy / maintain it?". Cover sidebar contract,
+every tab, recommended first-run flow, dashboard limits,
+troubleshooting matrix, Docker workflow, CLI cheat-sheet, env vars,
+backup/restore, upgrade procedure, install troubleshooting,
+production-hardening notes.
+
+## 3b9f296 — predictor: apply learned half-life + source weights live; sectors auto-load from DB
+
+*8 files, +368 / −30*
+
+Closes two gaps where the system claimed behavior it didn't deliver.
+
+`aggregate.daily_sentiment_index` gains a `source_weights` dict arg;
+per-article weight becomes `recency_weight × source_weights.get(a.source, 1.0)`.
+`rolling_baseline` forwards `half_life_hours` + `source_weights` to
+every inner daily call so the baseline tracks the live config.
+
+`predict_market`, `predict_sector`, `predict_stock`,
+`predict_all_sectors`, `predict_all_stocks` all gain the four
+learnable params and forward them. `predict_sector` refactored:
+`_sector_articles_scores` became `_sector_scored_articles` returning
+(article, score) pairs so per-source weights can be applied.
+
+`predict_all_sectors(sector_universe=None)` now reads from cached
+`RelatedEntity(relationship="ETF_HOLDING")` rows via the new
+`_sector_universe_from_db(session)` helper. One click in
+*Focus → Sector → Refresh constituents* now makes every subsequent
+daily ingest produce a sector Call automatically.
+
+`ingestion.jobs.run_daily_ingest` builds a single `learned_kwargs`
+dict from `active_weights(session)` and threads it through every
+predictor — half-life and source weights now actually take effect at
+live scoring time.
+
+## bbfb07e — production hardening: auth gate, non-root Docker, Postgres, JSON logs, ingest CLI
+
+*12 files, +762 / −9*
+
+Six hardening items from `installation-manual §9` in one pass.
+
+New module `finn_predictor/security.py`:
+* `hash_password(plaintext)` / `verify_password(plaintext, hash)` —
+  bcrypt wrappers. Cost factor 12. Constant-time check.
+* `auth_enabled()` / `current_password_hash()` — env helpers.
+* `SecretScrubFilter` — logging filter that masks anything matching
+  the Finnhub-token regex (40-char [0-9a-z]) or the bcrypt-hash
+  prefix. Defence in depth behind the three explicit scrubbing layers
+  on the ingestion path.
+
+UI: `_enforce_auth_gate()` runs before `main()` does anything else.
+When `FINN_PREDICTOR_PASSWORD_HASH` is set, the page renders a
+password prompt until the right plaintext unlocks the
+session_state authentication flag. Unset = no auth = same default-
+localhost behaviour.
+
+New module `finn_predictor/logging_config.py`: `setup_logging(fmt=)`
+reads `FINN_PREDICTOR_LOG_FORMAT` (`text`|`json`, default `text`)
+and `FINN_PREDICTOR_LOG_LEVEL` (default `INFO`). JSON path emits
+one-record-per-line `{ts, level, logger, message, exc_info?}`. Both
+formats attach `SecretScrubFilter` to every handler.
+
+Postgres dialect: new `_dialect_insert(session)` helper picks
+`sqlalchemy.dialects.postgresql.insert` vs `sqlite.insert` at runtime
+based on the bound dialect. Both upsert call sites switched to it.
+`psycopg[binary]>=3.1` in `requirements.txt`.
+
+Docker: Dockerfile now adds a system user `finn` (uid 1001, no
+shell, no home), `chown`s /app + /data, `USER finn`. Runtime
+process never has root.
+
+CLI: two new subcommands.
+* `hash-password [plaintext]` — prints a bcrypt hash + the exact
+  `export FINN_PREDICTOR_PASSWORD_HASH=...` line on stderr.
+  Reads from stdin via `getpass.getpass` when called without args so
+  the plaintext stays out of shell history.
+* `ingest` — runs one `run_daily_ingest` cycle headlessly. Reads
+  `FINNHUB_API_KEY` from env. Suitable for cron / scheduled-task
+  sidecar. Crontab example in `installation-manual §5.1`.
+
+New deps:
+* `bcrypt>=4.0` (auth gate)
+* `psycopg[binary]>=3.1` (Postgres driver; in default
+  `requirements.txt` so the image works against either store
+  out of the box)
+
+337 tests passing at 95% coverage by this commit.
+
 ---
 
 ## Files added (by directory)
@@ -280,12 +511,15 @@ UI:
 ```
 finn_predictor/
   __init__.py
-  config.py
+  config.py · cli.py · logging_config.py · security.py
   ingestion/
-    __init__.py · backfill.py · client.py · jobs.py · news.py · prices.py
+    __init__.py · backfill.py · client.py · jobs.py · news.py ·
+    prices.py · prices_yf.py
+  learning/
+    __init__.py · config.py · simulate.py · train.py
   predictor/
-    __init__.py · aggregate.py · backtest.py · explain.py · market.py ·
-    sectors.py · stocks.py
+    __init__.py · aggregate.py · backtest.py · explain.py · focus.py ·
+    market.py · sectors.py · stocks.py · trades.py
   sentiment/
     __init__.py · base.py · finbert.py · vader.py
   storage/
@@ -296,13 +530,17 @@ finn_predictor/
 
 tests/
   __init__.py · conftest.py · test_aggregate.py · test_backfill.py ·
-  test_backtest.py · test_config.py · test_explain.py ·
-  test_ingestion_client.py · test_ingestion_news_prices.py · test_jobs.py ·
+  test_backtest.py · test_cli.py · test_config.py · test_explain.py ·
+  test_focus.py · test_ingestion_client.py · test_ingestion_news_prices.py ·
+  test_jobs.py · test_learning.py · test_logging_config.py ·
   test_predictor_market.py · test_predictor_sectors.py ·
-  test_predictor_stocks.py · test_sentiment.py · test_storage_repo.py ·
-  test_stories.py · test_symbol_names.py · test_ui_helpers.py
+  test_predictor_stocks.py · test_prices_yf.py · test_security.py ·
+  test_sentiment.py · test_storage_repo.py · test_stories.py ·
+  test_symbol_names.py · test_trades.py · test_ui_helpers.py
 
-progress.md · summary.md · diff.md · pytest.ini · .coveragerc
+progress.md · summary.md · diff.md · user-manual.md ·
+installation-manual.md · pytest.ini · .coveragerc · requirements.txt ·
+Dockerfile · docker-compose.yml · docker/entrypoint.sh · .dockerignore
 ```
 
 ## Files in the upstream library that were NOT touched
@@ -312,9 +550,12 @@ The original `finnhub-python` client is unchanged. We catalogued it in
 
 ```
 finnhub/__init__.py · finnhub/client.py · finnhub/exceptions.py
-setup.py · setup.cfg · requirements.txt · test-requirements.txt ·
-tox.ini · examples.py · README.md · CHANGELOG.md · LICENSE
+setup.py · setup.cfg · test-requirements.txt · tox.ini · examples.py ·
+README.md · CHANGELOG.md · LICENSE
 ```
 
-The only edit outside `finn_predictor/` was an addition to `.gitignore`
-(`finn_predictor.db`, `*.sqlite`, `*.sqlite3`).
+`requirements.txt` at the repo root is **new** — it lists this app's
+deps, separate from the upstream library's pure-library
+`setup.py:REQUIRES`. The only other edit outside `finn_predictor/` was
+an addition to `.gitignore` (`finn_predictor.db`, `*.sqlite`,
+`*.sqlite3`).

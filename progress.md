@@ -312,6 +312,14 @@ python3 -m venv .venv
 - 2026-05-19 — Per-stock directional predictor + compact UI table (`eee1f26`).
 - 2026-05-19 — Sidebar error wording distinguishes "news 403" from "candles 403, news empty" (`0fb1117`).
 - 2026-05-19 — Historical company-news backfill (chunked) + retroactive per-day predictions (`1f936f4`).
+- 2026-05-19 — Hypothetical-trade simulator + yfinance price ingestion + Performance tab with accuracy charts (`c6949c7`).
+- 2026-05-19 — Focus tab (Company / Sector / Event drill-downs) + `RelatedEntity` schema for cached peers / supply chain / ETF holdings (`290f387`).
+- 2026-05-19 — Self-improvement layer: `LearnedWeight` schema + Bayesian optimisation over threshold / σ floor / half-life / per-source weights + Learning tab (`dd9790d`).
+- 2026-05-19 — Activation policy toggle (AUTO/MANUAL) persisted in new `app_settings` table; per-row Activate buttons in version history (`c48b339`).
+- 2026-05-19 — Holdout-improvement gate; new CLI module (`serve`/`reset-db`/`retrain`); Dockerfile + docker-compose + entrypoint + `RESET_DB` env var (`dcef051`).
+- 2026-05-19 — User manual + installation manual added (`c8e6314`).
+- 2026-05-19 — Half-life + source weights actually applied at live scoring time; `predict_all_sectors` defaults to reading constituent universe from cached `ETF_HOLDING` rows (`3b9f296`).
+- 2026-05-19 — Production hardening: bcrypt auth gate around the UI, non-root Docker user, Postgres dialect support, structured JSON logging with `SecretScrubFilter` on every handler, CLI `ingest` + `hash-password` subcommands (`bbfb07e`).
 
 ---
 
@@ -367,51 +375,67 @@ python3 -m venv .venv
 `pytest --cov` latest run:
 
 ```
-213 passed
-TOTAL  960 stmts  15 miss  230 br  12 part   98%
+337 passed
+TOTAL  2064 stmts  80 miss  518 br  46 part   95%
 ```
 
-Per-module: every non-UI module ≥ **94%** line+branch coverage; most at
-100%. The Streamlit `main()` is excluded from coverage but its pure
-helpers (24 of them — `recent_headlines`, `prediction_history`,
-`sector_grid`, `partition_predictions`, `stock_predictions_table`,
-`contribution_chart_data`, `build_contribution_chart`,
-`_format_headline_markdown`, `attach_first_seen`,
-`headlines_from_contributions`, `run_ingestion_with_key`,
-`run_backfill_with_key`, and more) are.
+The score dipped slightly from 98% as we added the bigger packages
+(`learning/`, `focus.py`, `cli.py`, the Performance + Focus + Learning
+UI tabs). All non-UI modules remain at ≥ **88%** line+branch coverage;
+the bulk of the misses are unreachable Protocol stubs in
+`sentiment/base.py` and a couple of lazy-import branches that would
+need real `torch` / `transformers` / `psycopg` runs to exercise.
 
-**No test makes a real Finnhub call.** Every external HTTP call goes
-through `FinnhubGateway`, which is mocked.
+The Streamlit `main()` itself is excluded from coverage but every
+pure helper underneath it is tested — the test surface now covers
+the auth gate, dialect-aware upserts, JSON log emission, all the
+new chart builders, and end-to-end "learned weights actually shift
+a prediction" assertions.
 
-### 5.5 Known limitations (current)
+**No test makes a real Finnhub or yfinance call.** Finnhub calls go
+through the mocked `FinnhubGateway`; yfinance calls go through an
+injectable `history_fn` so test code supplies canned DataFrames.
+
+### 5.5 What can break — and how the system handles it
 
 * **No history for general market news.** Finnhub's `/news` paginates
   forward only — the whole-market `^GSPC` baseline can only build up
-  over wall-clock time.
-* **`/stock/candle` is gated on free-tier keys** (we see 403). All
-  predictions still write fine; only the realised-return validation
-  (`prediction_outcomes`) stays empty.
+  over wall-clock time. Per-stock and per-sector baselines *can* be
+  bootstrapped via `/company-news` backfill.
+* **`/stock/candle` gated on free-tier keys.** We see 403. yfinance
+  fills the gap automatically — click *Backfill prices* in the
+  sidebar.
 * **Day-1 over-confidence.** When a ticker is newly ingested, the
-  rolling baseline σ floors at `MIN_BASELINE_SIGMA = 0.05`. Even modest
-  sentiment can z-score above the threshold; the confidence number can
-  pin at 1.00 on small samples. Backfill mitigates this for stocks by
-  giving the baseline 30+ days of history immediately.
+  rolling baseline σ floors at `MIN_BASELINE_SIGMA` (default `0.05`,
+  learnable). Backfill mitigates this for stocks; the learner shrinks
+  the floor once the holdout supports it.
 * **Story clustering is heuristic.** First-8-word prefix matching;
   fully-rewritten headlines on the same event won't cluster, and
   shared-lead but distinct stories will. Acceptable trade-off without
   embeddings.
-* **Classifier is rule-based.** Confidence is normalised z-distance,
-  not probability. FinBERT is wired but not active by default.
+* **Classifier is still rule-based.** Confidence is normalised
+  z-distance, not probability. FinBERT is wired (architecture
+  accepts it via the `Scorer` Protocol) but not active by default.
+* **The auth gate is single-user / single-password.** Use a reverse
+  proxy with TLS + SSO for anything more than localhost dev.
 
 ### 5.6 Files added on this branch
 
 See `diff.md` for per-commit detail. High level:
 
-* 19 Python files under `finn_predictor/` (5 sub-packages + 2 single
-  modules), ~3 000 LoC.
-* 17 test modules under `tests/` (one per Python module, plus
-  `conftest.py`), 213 tests, ~3 500 LoC.
-* `progress.md`, `summary.md`, `diff.md`, `pytest.ini`, `.coveragerc`.
-* One additive line group in `.gitignore` for the local SQLite file.
+* **27 Python files** under `finn_predictor/` across 6 sub-packages
+  (`ingestion`, `learning`, `predictor`, `sentiment`, `storage`,
+  `ui`) plus four top-level modules (`config.py`, `cli.py`,
+  `logging_config.py`, `security.py`). ~5 800 LoC.
+* **22 test modules** under `tests/` (one per source module plus
+  `conftest.py`), 337 tests, ~6 000 LoC.
+* Five doc files at repo root: `progress.md`, `summary.md`,
+  `diff.md`, `user-manual.md`, `installation-manual.md`.
+* Build/deploy files at repo root: `requirements.txt`, `pytest.ini`,
+  `.coveragerc`, `Dockerfile`, `docker-compose.yml`,
+  `docker/entrypoint.sh`, `.dockerignore`.
+* One additive line group in `.gitignore` for `*.sqlite` /
+  `*.sqlite3` / `finn_predictor.db`.
 
-The upstream `finnhub-python` library is unchanged.
+The upstream `finnhub-python` library is unchanged. Branch totals vs.
+`master`: **75 files changed, ~15,800 insertions(+), 3 deletions(-)**.
