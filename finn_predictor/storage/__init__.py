@@ -2,6 +2,7 @@
 
 from finn_predictor.storage.engine import create_engine_and_session, init_db
 from finn_predictor.storage.models import (
+    AppSetting,
     Base,
     LearnedWeight,
     NewsArticle,
@@ -20,6 +21,7 @@ from finn_predictor.storage.symbol_names import (
 )
 
 __all__ = [
+    "AppSetting",
     "Base",
     "LearnedWeight",
     "NewsArticle",

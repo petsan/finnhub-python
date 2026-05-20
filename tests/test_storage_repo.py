@@ -202,6 +202,75 @@ def test_migrate_predictions_keeps_separate_target_symbols(session) -> None:
     assert len(predictions_for(session, "XLE")) == 1
 
 
+def test_app_settings_get_set_roundtrip(session) -> None:
+    from finn_predictor.storage.repo import (
+        get_setting, set_setting,
+    )
+    assert get_setting(session, "missing", default="d") == "d"
+    set_setting(session, "k", "v1")
+    assert get_setting(session, "k") == "v1"
+    # Upsert: overwriting same key updates rather than duplicates.
+    set_setting(session, "k", "v2")
+    assert get_setting(session, "k") == "v2"
+
+
+def test_activation_policy_defaults_and_set(session) -> None:
+    from finn_predictor.storage.repo import (
+        POLICY_AUTO, POLICY_MANUAL,
+        get_activation_policy, set_activation_policy,
+    )
+    # Default is AUTO when nothing has been set.
+    assert get_activation_policy(session) == POLICY_AUTO
+    set_activation_policy(session, POLICY_MANUAL)
+    assert get_activation_policy(session) == POLICY_MANUAL
+
+
+def test_activation_policy_rejects_unknown_value(session) -> None:
+    from finn_predictor.storage.repo import set_activation_policy
+    with pytest.raises(ValueError):
+        set_activation_policy(session, "WHATEVER")
+
+
+def test_activation_policy_unknown_persisted_falls_back_to_auto(session) -> None:
+    """If the DB somehow holds a junk value, the getter coerces to AUTO."""
+    from finn_predictor.storage.repo import (
+        POLICY_AUTO, get_activation_policy, set_setting,
+        SETTING_ACTIVATION_POLICY,
+    )
+    set_setting(session, SETTING_ACTIVATION_POLICY, "GARBAGE")
+    assert get_activation_policy(session) == POLICY_AUTO
+
+
+def test_activate_learned_version_flips_flags(session) -> None:
+    from finn_predictor.storage.models import LearnedWeight
+    from finn_predictor.storage.repo import activate_learned_version
+
+    session.add_all(
+        [
+            LearnedWeight(version=1, dimension="THRESHOLD_SIGMA",
+                          value=0.4, is_active=True),
+            LearnedWeight(version=1, dimension="MIN_BASELINE_SIGMA",
+                          value=0.05, is_active=True),
+            LearnedWeight(version=2, dimension="THRESHOLD_SIGMA",
+                          value=0.6, is_active=False),
+            LearnedWeight(version=2, dimension="MIN_BASELINE_SIGMA",
+                          value=0.08, is_active=False),
+        ]
+    )
+    session.commit()
+    n = activate_learned_version(session, 2)
+    assert n == 2  # both v2 rows now active
+
+    actives = session.query(LearnedWeight).filter_by(is_active=True).all()
+    assert {a.version for a in actives} == {2}
+
+
+def test_activate_learned_version_raises_on_missing_version(session) -> None:
+    from finn_predictor.storage.repo import activate_learned_version
+    with pytest.raises(ValueError):
+        activate_learned_version(session, 99)
+
+
 def test_utc_day_window_normalises_to_midnight() -> None:
     start, end = utc_day_window(D0)
     assert start.tzinfo is timezone.utc

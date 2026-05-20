@@ -72,6 +72,13 @@ from finn_predictor.learning.train import (
     NotEnoughDataError,
 )
 from finn_predictor.storage.models import LearnedWeight
+from finn_predictor.storage.repo import (
+    POLICY_AUTO,
+    POLICY_MANUAL,
+    activate_learned_version,
+    get_activation_policy,
+    set_activation_policy,
+)
 from finn_predictor.predictor.stocks import retroactive_predict_many
 from finn_predictor.predictor.trades import (
     PerformanceSummary,
@@ -1808,6 +1815,27 @@ def _render_learning_tab(session: Session) -> None:  # pragma: no cover
         "inspect them."
     )
 
+    # --- Activation policy toggle (persisted across sessions) -------
+    st.subheader("Activation policy")
+    current_policy = get_activation_policy(session)
+    policy_idx = 0 if current_policy == POLICY_AUTO else 1
+    chosen = st.radio(
+        "When training finishes:",
+        options=[POLICY_AUTO, POLICY_MANUAL],
+        index=policy_idx,
+        format_func=lambda v: (
+            "Auto-activate — newest version wins" if v == POLICY_AUTO
+            else "Manual approval — leave new version inactive; you click Activate"
+        ),
+        horizontal=False,
+        key="activation_policy_radio",
+    )
+    if chosen != current_policy:
+        set_activation_policy(session, chosen)
+        st.success(f"Activation policy set to **{chosen}**.")
+        # Re-read so subsequent renders this frame reflect the new value.
+        current_policy = chosen
+
     cfg = active_weights(session)
     st.subheader("Active weights")
     cols = st.columns(4)
@@ -1900,7 +1928,7 @@ def _render_learning_tab(session: Session) -> None:  # pragma: no cover
                 }
             )
 
-    # History of versions.
+    # History of versions + per-row Activate buttons.
     st.subheader("Version history")
     hist_rows = list(
         session.scalars(
@@ -1936,6 +1964,34 @@ def _render_learning_tab(session: Session) -> None:  # pragma: no cover
                 ),
             },
         )
+
+        # Per-row Activate buttons. Skip the row already active; one
+        # row at a time so the rerun is clean.
+        st.caption(
+            "Click *Activate* on a non-active version to flip the live "
+            "weights. Useful when activation policy is set to Manual, "
+            "or for reverting after an auto-activated retrain."
+        )
+        inactive_rows = [r for r in hist_rows if not r.is_active]
+        if inactive_rows:
+            cols = st.columns(min(len(inactive_rows), 4))
+            for i, r in enumerate(inactive_rows[: len(cols)]):
+                clicked = cols[i].button(
+                    f"Activate v{r.version}",
+                    key=f"activate_v{r.version}",
+                )
+                if clicked:
+                    try:
+                        activate_learned_version(session, r.version)
+                        st.success(f"Activated version {r.version}.")
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(f"Activation failed: {exc}")
+            if len(inactive_rows) > len(cols):
+                st.caption(
+                    f"…{len(inactive_rows) - len(cols)} older inactive "
+                    "version(s) not shown."
+                )
 
 
 def _render_learning_tab_wrapped(session: Session) -> None:

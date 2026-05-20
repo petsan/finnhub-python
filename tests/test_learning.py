@@ -377,3 +377,78 @@ def test_train_weights_activate_false_keeps_old(session) -> None:
     )
     cfg = active_weights(session)
     assert cfg.version == 1  # untouched
+
+
+def test_train_weights_respects_manual_policy(session) -> None:
+    """activate=None means "consult the setting"; MANUAL leaves new version
+    inactive even when it's the only one."""
+    from finn_predictor.storage.repo import POLICY_MANUAL, set_activation_policy
+
+    for i in range(12):
+        _seed_one_day(
+            session, target="^GSPC",
+            day=D - timedelta(days=20 + i),
+            scores=[0.5] * 3, ret=0.005, hit_label="UP",
+        )
+    set_activation_policy(session, POLICY_MANUAL)
+    report = train_weights(session, model_version=MV, n_calls=10)
+    assert report.version == 1
+    # Active config falls back to defaults because no version is active.
+    cfg = active_weights(session)
+    assert cfg.version is None
+
+
+def test_train_weights_respects_auto_policy(session) -> None:
+    from finn_predictor.storage.repo import POLICY_AUTO, set_activation_policy
+
+    for i in range(12):
+        _seed_one_day(
+            session, target="^GSPC",
+            day=D - timedelta(days=20 + i),
+            scores=[0.5] * 3, ret=0.005, hit_label="UP",
+        )
+    set_activation_policy(session, POLICY_AUTO)
+    report = train_weights(session, model_version=MV, n_calls=10)
+    assert report.version == 1
+    cfg = active_weights(session)
+    assert cfg.version == 1
+
+
+def test_train_weights_explicit_activate_overrides_setting(session) -> None:
+    """`activate=True` always activates, even when policy is MANUAL."""
+    from finn_predictor.storage.repo import POLICY_MANUAL, set_activation_policy
+
+    for i in range(12):
+        _seed_one_day(
+            session, target="^GSPC",
+            day=D - timedelta(days=20 + i),
+            scores=[0.5] * 3, ret=0.005, hit_label="UP",
+        )
+    set_activation_policy(session, POLICY_MANUAL)
+    train_weights(session, model_version=MV, n_calls=10, activate=True)
+    cfg = active_weights(session)
+    assert cfg.version == 1
+
+
+def test_activate_learned_version_works_after_manual_train(session) -> None:
+    """The full flow: MANUAL policy → train → manually activate later."""
+    from finn_predictor.storage.repo import (
+        POLICY_MANUAL,
+        activate_learned_version,
+        set_activation_policy,
+    )
+
+    for i in range(12):
+        _seed_one_day(
+            session, target="^GSPC",
+            day=D - timedelta(days=20 + i),
+            scores=[0.5] * 3, ret=0.005, hit_label="UP",
+        )
+    set_activation_policy(session, POLICY_MANUAL)
+    report = train_weights(session, model_version=MV, n_calls=10)
+    assert active_weights(session).version is None
+
+    # User clicks Activate in the UI.
+    activate_learned_version(session, report.version)
+    cfg = active_weights(session)
+    assert cfg.version == report.version

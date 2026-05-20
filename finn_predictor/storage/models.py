@@ -165,6 +165,23 @@ class Prediction(Base):
     )
 
 
+class AppSetting(Base):
+    """Tiny key/value table for cross-session UI settings.
+
+    Used today for ``activation_policy`` ∈ {AUTO, MANUAL}. Survives
+    Streamlit restarts (unlike ``st.session_state``) and is the
+    canonical source the predictor + training loop read from.
+    """
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(256), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
 class LearnedWeight(Base):
     """One row per (version, dimension, key) learned during a training run.
 

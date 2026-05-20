@@ -40,6 +40,11 @@ from finn_predictor.learning.simulate import (
 )
 from finn_predictor.sentiment.vader import VaderScorer
 from finn_predictor.storage.models import LearnedWeight
+from finn_predictor.storage.repo import (
+    POLICY_AUTO,
+    activate_learned_version,
+    get_activation_policy,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -164,10 +169,13 @@ def _next_version(session: Session) -> int:
 
 
 def _activate_version(session: Session, version: int) -> None:
-    """Set ``is_active = True`` for the given version, False for the rest."""
-    for row in session.scalars(select(LearnedWeight)):
-        row.is_active = row.version == version
-    session.commit()
+    """Set ``is_active = True`` for the given version, False for the rest.
+
+    Kept as a private wrapper so callers don't need to import the repo
+    helper directly. The shared implementation lives in
+    :func:`storage.repo.activate_learned_version`.
+    """
+    activate_learned_version(session, version)
 
 
 def _persist_weights(
@@ -221,7 +229,7 @@ def train_weights(
     model_version: Optional[str] = None,
     n_calls: int = DEFAULT_N_CALLS,
     holdout_days: int = HOLDOUT_DAYS,
-    activate: bool = True,
+    activate: Optional[bool] = None,
     random_state: int = 0,
 ) -> TrainingReport:
     """Run Bayesian optimisation over the learnable dimensions.
@@ -235,7 +243,11 @@ def train_weights(
            ``gp_minimize``; the search space is the three scalar knobs
            (threshold, min_sigma, half_life) listed in :data:`SEARCH_SPACE`.
         5. Persist the fitted weights as a new :class:`LearnedWeight`
-           version. If ``activate`` is True (default) flip the active flag.
+           version. The ``activate`` argument decides whether to flip
+           it live: ``True`` always activates, ``False`` never activates,
+           and the default ``None`` reads the persisted
+           ``activation_policy`` setting (AUTO ⇒ activate, MANUAL ⇒
+           leave inactive — user must click *Activate* in the UI).
 
     Raises :class:`NotEnoughDataError` when fewer than
     :data:`MIN_TRADES_FOR_TRAINING` closed predictions exist.
@@ -326,6 +338,11 @@ def train_weights(
         training_score=training_score,
         holdout_score=holdout_score,
     )
+
+    # Resolve the activation decision. Explicit True/False from the
+    # caller wins; None means "consult the persisted policy".
+    if activate is None:
+        activate = get_activation_policy(session) == POLICY_AUTO
     if activate:
         _activate_version(session, version)
 

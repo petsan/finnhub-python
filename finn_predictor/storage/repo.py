@@ -10,6 +10,8 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from finn_predictor.storage.models import (
+    AppSetting,
+    LearnedWeight,
     NewsArticle,
     PriceBar,
     Prediction,
@@ -390,6 +392,80 @@ def related_entities_for(
         key=lambda r: (r.rank is None, r.rank if r.rank is not None else 0, r.related_symbol)
     )
     return rows
+
+
+# -- App settings (cross-session UI preferences) ---------------------------
+
+# Canonical key for the activation policy. Values are "AUTO" or "MANUAL".
+SETTING_ACTIVATION_POLICY = "activation_policy"
+POLICY_AUTO = "AUTO"
+POLICY_MANUAL = "MANUAL"
+VALID_POLICIES = frozenset({POLICY_AUTO, POLICY_MANUAL})
+
+
+def get_setting(
+    session: Session, key: str, *, default: Optional[str] = None
+) -> Optional[str]:
+    """Read a row from app_settings; returns ``default`` when missing."""
+    row = session.scalar(select(AppSetting).where(AppSetting.key == key))
+    return row.value if row is not None else default
+
+
+def set_setting(session: Session, key: str, value: str) -> AppSetting:
+    """Upsert an app_settings row. Stamps ``updated_at`` to now."""
+    now = _utcnow()
+    existing = session.scalar(select(AppSetting).where(AppSetting.key == key))
+    if existing is not None:
+        existing.value = value
+        existing.updated_at = now
+        session.commit()
+        return existing
+    row = AppSetting(key=key, value=value, updated_at=now)
+    session.add(row)
+    session.commit()
+    return row
+
+
+def get_activation_policy(session: Session) -> str:
+    """Read activation_policy with AUTO as the safe default."""
+    val = get_setting(session, SETTING_ACTIVATION_POLICY, default=POLICY_AUTO)
+    if val not in VALID_POLICIES:
+        return POLICY_AUTO
+    return val
+
+
+def set_activation_policy(session: Session, value: str) -> None:
+    """Set activation_policy. Rejects unknown values."""
+    if value not in VALID_POLICIES:
+        raise ValueError(
+            f"activation_policy must be one of {sorted(VALID_POLICIES)}, got {value!r}"
+        )
+    set_setting(session, SETTING_ACTIVATION_POLICY, value)
+
+
+# -- LearnedWeight activation ---------------------------------------------
+
+
+def activate_learned_version(session: Session, version: int) -> int:
+    """Flip is_active=True on rows with ``version`` and False on the rest.
+
+    Returns the number of rows updated to active. Raises if no rows exist
+    for that version (a no-op activate would be silent breakage).
+    """
+    rows = list(
+        session.scalars(select(LearnedWeight).where(LearnedWeight.version == version))
+    )
+    if not rows:
+        raise ValueError(f"no LearnedWeight rows exist for version {version!r}")
+    n_activated = 0
+    for r in session.scalars(select(LearnedWeight)):
+        target = r.version == version
+        if r.is_active != target:
+            r.is_active = target
+        if target:
+            n_activated += 1
+    session.commit()
+    return n_activated
 
 
 # -- Date helpers used widely ----------------------------------------------
