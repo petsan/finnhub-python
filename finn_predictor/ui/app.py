@@ -77,7 +77,9 @@ from finn_predictor.storage.repo import (
     POLICY_MANUAL,
     activate_learned_version,
     get_activation_policy,
+    get_holdout_tolerance,
     set_activation_policy,
+    set_holdout_tolerance,
 )
 from finn_predictor.predictor.stocks import retroactive_predict_many
 from finn_predictor.predictor.trades import (
@@ -1836,6 +1838,23 @@ def _render_learning_tab(session: Session) -> None:  # pragma: no cover
         # Re-read so subsequent renders this frame reflect the new value.
         current_policy = chosen
 
+    # Holdout gate tolerance — only meaningful under AUTO; render under
+    # both for discoverability but greyed-out semantics are explained.
+    current_tol = get_holdout_tolerance(session)
+    new_tol = st.slider(
+        "Holdout-gate tolerance (objective units)",
+        min_value=0.0, max_value=0.10, value=current_tol, step=0.005,
+        help=(
+            "Under AUTO policy, a newly trained version is activated "
+            "only if its holdout score is within (active − tolerance) "
+            "of the currently live config (re-scored on the same "
+            "window). 0.00 = strict (no regressions allowed); 0.10 = "
+            "very permissive. Has no effect under MANUAL policy."
+        ),
+    )
+    if abs(new_tol - current_tol) > 1e-9:
+        set_holdout_tolerance(session, new_tol)
+
     cfg = active_weights(session)
     st.subheader("Active weights")
     cols = st.columns(4)
@@ -1898,10 +1917,17 @@ def _render_learning_tab(session: Session) -> None:  # pragma: no cover
                 report = None
 
         if report is not None:
-            st.success(
+            header = (
                 f"Trained version {report.version} "
                 f"(train n={report.n_train}, holdout n={report.n_holdout})"
             )
+            if report.gate_blocked:
+                st.warning(header + " — gate **blocked** activation")
+            elif report.activated:
+                st.success(header + " — activated")
+            else:
+                st.info(header + " — saved but not activated")
+
             cols = st.columns(2)
             cols[0].metric(
                 "Training score",
@@ -1921,10 +1947,30 @@ def _render_learning_tab(session: Session) -> None:  # pragma: no cover
                 )
             else:
                 cols[1].metric("Holdout score", "—")
+
+            if report.gate_reason:
+                st.caption(report.gate_reason)
+                if not report.activated:
+                    if st.button(
+                        f"Activate v{report.version} anyway",
+                        key=f"override_gate_v{report.version}",
+                    ):
+                        try:
+                            activate_learned_version(session, report.version)
+                            st.success(
+                                f"Activated version {report.version} "
+                                "despite the gate."
+                            )
+                            st.rerun()
+                        except ValueError as exc:
+                            st.error(f"Activation failed: {exc}")
+
             st.json(
                 {
                     "fitted": report.fitted,
                     "source_weight_count": len(report.source_weights),
+                    "active_holdout_at_decision": report.active_holdout_score_at_decision,
+                    "tolerance": report.holdout_tolerance,
                 }
             )
 

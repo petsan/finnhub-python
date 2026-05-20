@@ -31,6 +31,7 @@ from finn_predictor.learning.config import (
     DIM_SOURCE_WEIGHT,
     DIM_THRESHOLD,
     LearnedConfig,
+    active_weights,
 )
 from finn_predictor.learning.simulate import (
     TrainingFrame,
@@ -44,6 +45,7 @@ from finn_predictor.storage.repo import (
     POLICY_AUTO,
     activate_learned_version,
     get_activation_policy,
+    get_holdout_tolerance,
 )
 
 
@@ -83,6 +85,14 @@ class TrainingReport:
     n_calls: int
     fitted: dict[str, float] = field(default_factory=dict)
     source_weights: dict[str, float] = field(default_factory=dict)
+    # Whether this version is the live one after train_weights returned.
+    activated: bool = False
+    # Gate diagnostics. Populated only when activation was eligible
+    # (policy=AUTO and an explicit override wasn't passed).
+    active_holdout_score_at_decision: Optional[float] = None
+    holdout_tolerance: Optional[float] = None
+    gate_blocked: bool = False
+    gate_reason: Optional[str] = None
 
 
 # ---------------- frame splitting ----------------
@@ -339,10 +349,48 @@ def train_weights(
         holdout_score=holdout_score,
     )
 
-    # Resolve the activation decision. Explicit True/False from the
-    # caller wins; None means "consult the persisted policy".
+    # Resolve the activation decision in two stages.
+    #
+    # 1. Policy stage: explicit True/False from the caller wins; None
+    #    means "consult the persisted policy".
+    # 2. Gate stage: when the policy says AUTO, re-score the currently-
+    #    active config on the SAME holdout window we just used and
+    #    refuse to activate if the new candidate scores worse than
+    #    (active_holdout - tolerance). The gate is a safety net for
+    #    auto runs; explicit `activate=True` from a caller skips it.
+    explicit_decision = activate is not None
     if activate is None:
         activate = get_activation_policy(session) == POLICY_AUTO
+
+    active_holdout_at_decision: Optional[float] = None
+    tolerance = get_holdout_tolerance(session)
+    gate_blocked = False
+    gate_reason: Optional[str] = None
+
+    if activate and use_holdout and not explicit_decision:
+        # Re-score the live config on this same holdout window so the
+        # comparison is apples-to-apples. The live config might be
+        # baseline defaults if nothing has been activated yet.
+        active_cfg = active_weights(session)
+        # The newly-persisted version's is_active flag is False until we
+        # flip it, so active_weights() correctly returns the prior live
+        # config. Score it on the holdout we just built.
+        active_holdout_at_decision = blended_objective(hold_frame, active_cfg)
+
+        if holdout_score is not None and (
+            holdout_score < active_holdout_at_decision - tolerance
+        ):
+            gate_blocked = True
+            gate_reason = (
+                f"holdout score {holdout_score:+.4f} is "
+                f"{active_holdout_at_decision - holdout_score:+.4f} "
+                f"below the live config's {active_holdout_at_decision:+.4f} "
+                f"on the same holdout window (tolerance {tolerance:.4f}). "
+                "The new version is saved but left inactive — flip it "
+                "manually in the UI if you want to override the gate."
+            )
+            activate = False
+
     if activate:
         _activate_version(session, version)
 
@@ -361,4 +409,9 @@ def train_weights(
             "half_life_hours": fitted_half_life,
         },
         source_weights=source_weights,
+        activated=activate,
+        active_holdout_score_at_decision=active_holdout_at_decision,
+        holdout_tolerance=tolerance,
+        gate_blocked=gate_blocked,
+        gate_reason=gate_reason,
     )

@@ -61,17 +61,33 @@ branch; left the upstream library untouched.
 ```bash
 # from repo root
 python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 .venv/bin/pip install -e .
-.venv/bin/pip install sqlalchemy apscheduler vaderSentiment streamlit \
-                     pandas altair pytest pytest-cov pytest-mock \
-                     requests-mock freezegun
 
 # run the dashboard (no key required to boot; UI surfaces a key input)
 .venv/bin/streamlit run finn_predictor/ui/app.py
 
 # tests + coverage
+.venv/bin/pip install pytest pytest-cov pytest-mock requests-mock freezegun
 .venv/bin/python -m pytest --cov
 ```
+
+### Docker
+
+```bash
+docker compose up --build                  # build + serve on http://localhost:8501
+                                           # reuses any data in the finn_data volume
+
+RESET_DB=1 docker compose up --build       # wipe DB on the way up
+
+docker compose run --rm app reset-db --yes # wipe DB, exit
+docker compose run --rm app retrain        # run one training cycle, print JSON
+docker compose run --rm app shell          # interactive bash inside the container
+```
+
+The SQLite file lives in a named volume (`finn_data`), so `docker compose
+down` keeps your articles, predictions, outcomes, and learned weights.
+`docker compose down -v` deletes the volume.
 
 Then open <http://127.0.0.1:8501>, paste a Finnhub key in the sidebar (it
 lives only in `st.session_state` — never on disk, never in the DB, never in

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -428,6 +429,136 @@ def test_train_weights_explicit_activate_overrides_setting(session) -> None:
     train_weights(session, model_version=MV, n_calls=10, activate=True)
     cfg = active_weights(session)
     assert cfg.version == 1
+
+
+def test_holdout_gate_blocks_regression(session) -> None:
+    """When the new candidate's holdout regresses by more than the
+    tolerance under AUTO policy, train_weights refuses to activate it."""
+    from finn_predictor.storage.repo import (
+        POLICY_AUTO,
+        activate_learned_version,
+        set_activation_policy,
+        set_holdout_tolerance,
+    )
+
+    # Seed enough data that both train and holdout windows are populated.
+    for i in range(20):
+        _seed_one_day(
+            session, target="^GSPC",
+            day=D - timedelta(days=1 + i),
+            scores=[0.5] * 3, ret=0.005, hit_label="UP",
+        )
+    set_activation_policy(session, POLICY_AUTO)
+    set_holdout_tolerance(session, 0.0)  # strict — any regression blocks
+
+    # v1 is the only version so it auto-activates uncontested.
+    r1 = train_weights(session, model_version=MV, n_calls=10, random_state=0)
+    assert r1.activated is True
+    assert r1.gate_blocked is False
+
+    # Stub the simulator so the new candidate's holdout score is far
+    # below the live (v1) config's holdout. The gate must catch this.
+    # We distinguish them via cfg.version: skopt evaluates candidates
+    # with version=None, while the gate's active re-score sees version=1.
+    from finn_predictor.learning import train as train_mod
+    real_blended = train_mod.blended_objective
+
+    def fake_blended(frame, cfg):
+        if cfg.version is None:
+            # The new candidate (and the baseline used for the report).
+            return -0.5
+        # The live config — clearly better.
+        return 0.5
+
+    with patch.object(train_mod, "blended_objective", fake_blended):
+        r2 = train_weights(
+            session, model_version=MV, n_calls=10, random_state=1,
+        )
+    assert r2.version == 2
+    assert r2.gate_blocked is True
+    assert r2.activated is False
+    assert r2.active_holdout_score_at_decision is not None
+    # v1 still live.
+    assert active_weights(session).version == 1
+    # User overrides the gate.
+    activate_learned_version(session, 2)
+    assert active_weights(session).version == 2
+
+
+def test_holdout_gate_does_not_block_when_tolerance_permits(session) -> None:
+    """A small regression within tolerance still activates."""
+    from finn_predictor.storage.repo import (
+        POLICY_AUTO,
+        set_activation_policy,
+        set_holdout_tolerance,
+    )
+
+    for i in range(20):
+        _seed_one_day(
+            session, target="^GSPC",
+            day=D - timedelta(days=1 + i),
+            scores=[0.5] * 3, ret=0.005, hit_label="UP",
+        )
+    set_activation_policy(session, POLICY_AUTO)
+    set_holdout_tolerance(session, 1.0)  # very permissive
+
+    train_weights(session, model_version=MV, n_calls=10)
+    r2 = train_weights(session, model_version=MV, n_calls=10)
+    # Either activated or gate-blocked but with the permissive tolerance
+    # the typical outcome is activation.
+    assert r2.activated or not r2.gate_blocked
+
+
+def test_holdout_gate_skipped_when_explicit_activate_true(session) -> None:
+    """Explicit `activate=True` bypasses the gate."""
+    from finn_predictor.storage.repo import (
+        POLICY_AUTO, set_activation_policy, set_holdout_tolerance,
+    )
+
+    for i in range(20):
+        _seed_one_day(
+            session, target="^GSPC",
+            day=D - timedelta(days=1 + i),
+            scores=[0.5] * 3, ret=0.005, hit_label="UP",
+        )
+    set_activation_policy(session, POLICY_AUTO)
+    set_holdout_tolerance(session, 0.0)
+
+    train_weights(session, model_version=MV, n_calls=10)
+    r2 = train_weights(
+        session, model_version=MV, n_calls=10, activate=True,
+    )
+    # gate diagnostics weren't computed because the caller forced activate.
+    assert r2.activated is True
+    assert r2.gate_blocked is False
+
+
+def test_holdout_tolerance_get_set_roundtrip(session) -> None:
+    from finn_predictor.storage.repo import (
+        DEFAULT_HOLDOUT_TOLERANCE,
+        get_holdout_tolerance,
+        set_holdout_tolerance,
+    )
+    assert get_holdout_tolerance(session) == DEFAULT_HOLDOUT_TOLERANCE
+    set_holdout_tolerance(session, 0.05)
+    assert get_holdout_tolerance(session) == pytest.approx(0.05)
+
+
+def test_holdout_tolerance_rejects_negative(session) -> None:
+    from finn_predictor.storage.repo import set_holdout_tolerance
+    with pytest.raises(ValueError):
+        set_holdout_tolerance(session, -0.01)
+
+
+def test_holdout_tolerance_junk_value_falls_back(session) -> None:
+    from finn_predictor.storage.repo import (
+        DEFAULT_HOLDOUT_TOLERANCE,
+        SETTING_HOLDOUT_TOLERANCE,
+        get_holdout_tolerance,
+        set_setting,
+    )
+    set_setting(session, SETTING_HOLDOUT_TOLERANCE, "garbage")
+    assert get_holdout_tolerance(session) == DEFAULT_HOLDOUT_TOLERANCE
 
 
 def test_activate_learned_version_works_after_manual_train(session) -> None:

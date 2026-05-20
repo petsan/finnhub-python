@@ -1,0 +1,45 @@
+# Finn-Predictor orchestration.
+#
+# Common workflows:
+#
+#   docker compose up                           # serve on http://localhost:8501
+#                                               # uses existing volume contents
+#
+#   docker compose up --build                   # rebuild image first
+#
+#   RESET_DB=1 docker compose up                # wipe DB on the way up
+#
+#   docker compose run --rm app reset-db --yes  # wipe + exit
+#   docker compose run --rm app retrain         # one train cycle + exit
+#   docker compose run --rm app shell           # interactive bash
+#
+# The SQLite DB lives in the `finn_data` named volume, so `docker
+# compose down` keeps your data and a subsequent `up` reuses it.
+# `docker compose down -v` (mind the -v) deletes the volume.
+
+services:
+  app:
+    build: .
+    image: finn-predictor:latest
+    container_name: finn-predictor
+    ports:
+      - "8501:8501"
+    environment:
+      # Sticky DB path inside the volume.
+      FINN_PREDICTOR_DB_URL: "sqlite:////data/finn_predictor.db"
+      # Set RESET_DB=1 in your shell before `docker compose up` to
+      # wipe the DB and start clean. Defaults to "0" (preserve).
+      RESET_DB: "${RESET_DB:-0}"
+    volumes:
+      - finn_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  finn_data:
+    name: finn_data

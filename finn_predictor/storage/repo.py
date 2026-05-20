@@ -402,6 +402,12 @@ POLICY_AUTO = "AUTO"
 POLICY_MANUAL = "MANUAL"
 VALID_POLICIES = frozenset({POLICY_AUTO, POLICY_MANUAL})
 
+# Tolerance (in objective units) for the holdout-improvement gate. A
+# new candidate must score within (current - tolerance) on the same
+# holdout window to be eligible for auto-activation.
+SETTING_HOLDOUT_TOLERANCE = "holdout_tolerance"
+DEFAULT_HOLDOUT_TOLERANCE = 0.01
+
 
 def get_setting(
     session: Session, key: str, *, default: Optional[str] = None
@@ -441,6 +447,31 @@ def set_activation_policy(session: Session, value: str) -> None:
             f"activation_policy must be one of {sorted(VALID_POLICIES)}, got {value!r}"
         )
     set_setting(session, SETTING_ACTIVATION_POLICY, value)
+
+
+def get_holdout_tolerance(session: Session) -> float:
+    """Read the holdout-gate tolerance. Defaults to :data:`DEFAULT_HOLDOUT_TOLERANCE`.
+
+    A junk value persisted in the DB falls back to the default.
+    """
+    raw = get_setting(session, SETTING_HOLDOUT_TOLERANCE)
+    if raw is None:
+        return DEFAULT_HOLDOUT_TOLERANCE
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_HOLDOUT_TOLERANCE
+    if v < 0:
+        return DEFAULT_HOLDOUT_TOLERANCE
+    return v
+
+
+def set_holdout_tolerance(session: Session, value: float) -> None:
+    """Set holdout-gate tolerance. Must be a non-negative float."""
+    v = float(value)
+    if v < 0 or v != v:  # reject NaN + negatives
+        raise ValueError("holdout_tolerance must be a non-negative float")
+    set_setting(session, SETTING_HOLDOUT_TOLERANCE, repr(v))
 
 
 # -- LearnedWeight activation ---------------------------------------------
