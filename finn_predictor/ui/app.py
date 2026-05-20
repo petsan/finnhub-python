@@ -632,26 +632,52 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                         company_symbols=symbols,
                     )
                     failures = counts.get("failures") or []
-                    if failures and counts.get("general_news", 0) == 0 and counts.get("scored", 0) == 0:
-                        # Everything failed — most likely a bad key or a fully
-                        # blocked plan. Show the first failure prominently.
+                    news_failure = next(
+                        (f for f in failures if f["op"] == "general_news"),
+                        None,
+                    )
+
+                    if news_failure is not None:
+                        # The /news endpoint itself rejected the request —
+                        # usually means the key lacks access, the plan was
+                        # downgraded, or a daily quota tripped. The candles
+                        # would have failed anyway on free-tier; this is the
+                        # one to act on.
                         st.sidebar.error(
-                            "Every Finnhub call failed — "
-                            f"first error: {failures[0]['error']}"
+                            f"News fetch (`{news_failure['op']}`) failed: "
+                            f"{news_failure['error']}\n\n"
+                            "Likely causes: invalid or rotated key, plan "
+                            "doesn't include `/news`, daily quota exhausted."
                         )
+                        if len(failures) > 1:
+                            with st.sidebar.expander(
+                                f"… plus {len(failures) - 1} other failure(s)",
+                                expanded=False,
+                            ):
+                                for f in failures:
+                                    if f is news_failure:
+                                        continue
+                                    st.write(f"**`{f['op']}`** — {f['error']}")
                     else:
                         st.sidebar.success(
                             f"Done — articles +{counts['general_news']}, "
                             f"scored {counts['scored']}, "
                             f"predictions {counts['predictions']}"
                         )
+                        if counts.get("general_news", 0) == 0 and not failures:
+                            st.sidebar.caption(
+                                "Note: `/news` returned no new articles this "
+                                "run. The feed is unchanged since the last "
+                                "ingestion."
+                            )
                         if failures:
                             with st.sidebar.expander(
-                                f"⚠ {len(failures)} endpoint(s) failed (expand for detail)",
+                                f"⚠ {len(failures)} endpoint(s) failed "
+                                "(expand for detail)",
                                 expanded=False,
                             ):
                                 for f in failures:
-                                    st.write(f"**{f['op']}** — {f['error']}")
+                                    st.write(f"**`{f['op']}`** — {f['error']}")
                 except Exception as exc:
                     # Triple-layer scrub: gateway + helper already replaced
                     # the token, but we run one more pass at the display
