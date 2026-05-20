@@ -117,6 +117,30 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    refresh = sub.add_parser(
+        "refresh-constituents",
+        help=(
+            "Headless equivalent of clicking 'Refresh constituents' in the "
+            "Focus → Sector mode for every seeded sector. Calls Finnhub's "
+            "/etf/holdings for each ETF and caches the result as "
+            "RelatedEntity(ETF_HOLDING) rows. Required prerequisite for "
+            "sector-level predictions and the cap-weighting fan-out."
+        ),
+    )
+    refresh.add_argument(
+        "--etf",
+        action="append",
+        default=None,
+        help=(
+            "Restrict to one or more specific ETF symbols (repeatable). "
+            "Default refreshes every sector in the DB."
+        ),
+    )
+    refresh.add_argument(
+        "--limit", type=int, default=25,
+        help="Maximum constituents to cache per sector (default 25).",
+    )
+
     return p
 
 
@@ -375,6 +399,95 @@ def cmd_fit_magnitude(*, target_symbol: str | None) -> int:
     return 0
 
 
+def cmd_refresh_constituents(
+    *, etfs: list[str] | None, limit: int
+) -> int:
+    """Cache ETF_HOLDING rows for every (or selected) sector.
+
+    Headless mirror of the Focus tab's *Refresh constituents* button.
+    Iterates the Sector table, calls Finnhub /etf/holdings per ETF,
+    upserts the result as RelatedEntity(ETF_HOLDING) rows so subsequent
+    daily ingests can produce sector predictions and the cap-weighting
+    fan-out has constituents to walk.
+
+    Exits 2 when FINNHUB_API_KEY is missing or no matching sectors
+    exist; 0 otherwise (per-sector failures land in the JSON output
+    rather than the rc, matching the resilient-ingest pattern).
+    """
+    from finn_predictor.config import load_settings
+    from finn_predictor.ingestion.client import FinnhubGateway, RateLimiter
+    from finn_predictor.predictor.focus import refresh_sector_constituents
+    from finn_predictor.storage.repo import all_sectors
+    from finnhub import Client as FinnhubClient
+
+    try:
+        settings = load_settings()  # requires FINNHUB_API_KEY
+    except RuntimeError as exc:
+        print(f"refresh-constituents: {exc}", file=sys.stderr)
+        return 2
+
+    url = _resolve_db_url()
+    engine, SessionLocal = create_engine_and_session(url)
+    init_db(engine)
+
+    # Normalise the ETF filter once. None/empty list means "everything".
+    wanted = {e.strip().upper() for e in (etfs or []) if e.strip()}
+
+    client = FinnhubClient(api_key=settings.finnhub_api_key)
+    try:
+        client._session.trust_env = False
+    except AttributeError:  # pragma: no cover
+        pass
+
+    summary: dict[str, object] = {
+        "refreshed": [],
+        "failures": [],
+        "skipped": [],
+    }
+
+    try:
+        gateway = FinnhubGateway(
+            client=client,
+            rate_limiter=RateLimiter(settings.rate_limit_per_minute),
+        )
+        with SessionLocal() as session:
+            sectors = list(all_sectors(session))
+            if not sectors:
+                print(
+                    "refresh-constituents: no sectors seeded; run "
+                    "`ingest` first (or call `ensure_default_sectors`)",
+                    file=sys.stderr,
+                )
+                return 2
+
+            for sector in sectors:
+                etf = sector.etf_symbol.strip().upper()
+                if wanted and etf not in wanted:
+                    summary["skipped"].append(etf)
+                    continue
+
+                # Resilient: a per-sector failure (free-tier 403 on
+                # /etf/holdings, network blip, etc.) doesn't block its
+                # peers — same pattern as run_daily_ingest's _try.
+                result = refresh_sector_constituents(
+                    session, gateway, etf_symbol=etf, limit=limit
+                )
+                if result.holdings_added > 0:
+                    summary["refreshed"].append(
+                        {"etf": etf, "holdings": result.holdings_added}
+                    )
+                # refresh_sector_constituents collects IngestionError
+                # into result.failures rather than raising — drain it
+                # into the summary so the operator sees it.
+                for f in result.failures:
+                    summary["failures"].append({"etf": etf, **f})
+    finally:
+        client.close()
+
+    print(json.dumps(summary, indent=2, default=str))
+    return 0
+
+
 def cmd_serve() -> int:
     """Print the Streamlit launch command; never starts it itself.
 
@@ -415,6 +528,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_fit_classifier(target_symbol=args.target_symbol)
     if cmd == "fit-magnitude":
         return cmd_fit_magnitude(target_symbol=args.target_symbol)
+    if cmd == "refresh-constituents":
+        return cmd_refresh_constituents(etfs=args.etf, limit=int(args.limit))
     parser.print_help(sys.stderr)
     return 2
 

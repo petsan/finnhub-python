@@ -449,6 +449,22 @@ boxes:
   `RelatedEntity(ETF_HOLDING)` rows for that sector via Finnhub's
   `/etf/holdings` endpoint. Then on the next ingestion run the
   sector's `predict_sector` finds tickers to aggregate.
+
+  *Headless equivalent* (for cron / batch / containers where the UI
+  isn't accessible):
+
+  ```bash
+  # Refresh every seeded sector in one shot:
+  python -m finn_predictor.cli refresh-constituents
+  # Or scope to specific ETFs:
+  python -m finn_predictor.cli refresh-constituents --etf XLK --etf XLV
+  # Adjust how many top constituents to cache per sector (default 25):
+  python -m finn_predictor.cli refresh-constituents --limit 50
+  ```
+
+  Reads `FINNHUB_API_KEY` from env. Per-sector failures (typically
+  a free-tier 403 on `/etf/holdings`) are isolated to that sector and
+  surface in the JSON output; the rest still land.
 * *"Constituents are cached, but the per-constituent company-news
   feed has no articles..."* — the cache is there but no
   `company`-category articles exist for those constituents in the

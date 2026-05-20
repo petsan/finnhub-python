@@ -323,6 +323,138 @@ def test_fit_magnitude_subcommand_success(tmp_path, monkeypatch, capsys) -> None
     assert taus == [0.10, 0.50, 0.90]
 
 
+def test_refresh_constituents_requires_api_key(capsys, tmp_path, monkeypatch) -> None:
+    """Without FINNHUB_API_KEY → rc=2 with a friendly message."""
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db")
+    rc = main(["refresh-constituents"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "FINNHUB_API_KEY" in err
+
+
+def test_refresh_constituents_rejects_unseeded_db(capsys, tmp_path, monkeypatch) -> None:
+    """No sectors in the DB → rc=2 (we don't auto-seed here)."""
+    monkeypatch.setenv("FINNHUB_API_KEY", "stub")
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db")
+    rc = main(["refresh-constituents"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "no sectors seeded" in err.lower()
+
+
+def _seed_sectors_db(db_url: str) -> None:
+    """Seed the default 11 sectors so the refresh CLI has something to iterate."""
+    from finn_predictor.storage import create_engine_and_session, init_db
+    from finn_predictor.storage.repo import ensure_default_sectors
+
+    engine, SL = create_engine_and_session(db_url)
+    init_db(engine)
+    with SL() as s:
+        ensure_default_sectors(s)
+    engine.dispose()
+
+
+def test_refresh_constituents_happy_path(tmp_path, monkeypatch, capsys) -> None:
+    """Mocked /etf/holdings → every sector's constituents land as ETF_HOLDING rows."""
+    db_url = f"sqlite:///{tmp_path}/f.db"
+    monkeypatch.setenv("FINNHUB_API_KEY", "stub")
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", db_url)
+    _seed_sectors_db(db_url)
+
+    # Patch the gateway's etfs_holdings to a deterministic payload per ETF.
+    fake_payload = {
+        "holdings": [
+            {"symbol": "AAPL", "name": "Apple Inc."},
+            {"symbol": "MSFT", "name": "Microsoft Corp."},
+            {"symbol": "NVDA", "name": "NVIDIA Corp."},
+        ]
+    }
+    with patch(
+        "finn_predictor.ingestion.client.FinnhubGateway.etfs_holdings",
+        return_value=fake_payload,
+    ):
+        rc = main(["refresh-constituents", "--limit", "3"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    parsed = json.loads(out)
+    refreshed = {entry["etf"] for entry in parsed["refreshed"]}
+    # All 11 default sectors should appear.
+    assert {"XLK", "XLE", "XLF", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU", "XLRE", "XLC"} <= refreshed
+    # 3 holdings per sector × 11 sectors = 33 row-inserts confirmed via the
+    # summary's per-sector counts.
+    assert all(entry["holdings"] == 3 for entry in parsed["refreshed"])
+
+    # And the DB now actually has the rows.
+    from finn_predictor.storage import create_engine_and_session, init_db
+    from finn_predictor.storage.models import RelatedEntity
+    engine, SL = create_engine_and_session(db_url)
+    init_db(engine)
+    with SL() as s:
+        n = s.query(RelatedEntity).filter(
+            RelatedEntity.relationship == "ETF_HOLDING"
+        ).count()
+    engine.dispose()
+    assert n == 33
+
+
+def test_refresh_constituents_isolates_per_sector_failures(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A 403 on one ETF doesn't block the others — failure goes in summary."""
+    db_url = f"sqlite:///{tmp_path}/f.db"
+    monkeypatch.setenv("FINNHUB_API_KEY", "stub")
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", db_url)
+    _seed_sectors_db(db_url)
+
+    from finn_predictor.ingestion.client import IngestionError
+
+    def _holdings(symbol):
+        if symbol == "XLE":
+            raise IngestionError("FinnhubAPI 403: gated on free tier")
+        return {
+            "holdings": [{"symbol": "GENERIC", "name": "Generic Inc."}],
+        }
+
+    with patch(
+        "finn_predictor.ingestion.client.FinnhubGateway.etfs_holdings",
+        side_effect=_holdings,
+    ):
+        rc = main(["refresh-constituents"])
+
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    failures = [f for f in parsed["failures"] if f["etf"] == "XLE"]
+    assert len(failures) == 1
+    # And the other 10 still landed in `refreshed`.
+    refreshed = {entry["etf"] for entry in parsed["refreshed"]}
+    assert "XLE" not in refreshed
+    assert len(refreshed) == 10
+
+
+def test_refresh_constituents_filter_by_etf(tmp_path, monkeypatch, capsys) -> None:
+    """--etf XLK --etf XLV restricts the run to those two sectors."""
+    db_url = f"sqlite:///{tmp_path}/f.db"
+    monkeypatch.setenv("FINNHUB_API_KEY", "stub")
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", db_url)
+    _seed_sectors_db(db_url)
+
+    with patch(
+        "finn_predictor.ingestion.client.FinnhubGateway.etfs_holdings",
+        return_value={"holdings": [{"symbol": "X", "name": "X"}]},
+    ):
+        rc = main(["refresh-constituents", "--etf", "XLK", "--etf", "XLV"])
+
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    refreshed = {entry["etf"] for entry in parsed["refreshed"]}
+    assert refreshed == {"XLK", "XLV"}
+    skipped = set(parsed["skipped"])
+    # Everything else got skipped — confirms the filter, not just an empty fan-out.
+    assert "XLE" in skipped
+
+
 def test_unknown_subcommand_returns_2(capsys, tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FINNHUB_API_KEY", "stub")
     monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db")
