@@ -174,6 +174,84 @@ def test_predict_market_uses_baseline_to_dampen_calls(session) -> None:
     assert pred.label == "FLAT"
 
 
+def test_predict_market_source_weights_shift_output(session) -> None:
+    """Same articles, different source weights → different sentiment_index.
+
+    End-to-end proof that the learner's source weights actually take
+    effect at live prediction time (not just inside the simulator).
+    """
+    # Two Reuters articles +0.9, two WSJ articles -0.9. With equal
+    # weights this is a wash. With Reuters boosted 4× it leans UP.
+    from tests.conftest import make_article as _ma
+    arts = [
+        _ma(finnhub_id=10, source="Reuters", published_at=D),
+        _ma(finnhub_id=11, source="Reuters", published_at=D),
+        _ma(finnhub_id=12, source="WSJ", published_at=D),
+        _ma(finnhub_id=13, source="WSJ", published_at=D),
+    ]
+    upsert_articles(session, arts)
+    persisted = session.query(type(arts[0])).order_by(type(arts[0]).finnhub_id).all()
+    save_scores(
+        session,
+        [
+            make_score(persisted[0].id, 0.9, model_version="vader-test"),
+            make_score(persisted[1].id, 0.9, model_version="vader-test"),
+            make_score(persisted[2].id, -0.9, model_version="vader-test"),
+            make_score(persisted[3].id, -0.9, model_version="vader-test"),
+        ],
+    )
+
+    # Both calls upsert into the same (target, day, model) row, so the
+    # second call overwrites the first in place — snapshot the index
+    # before the second call lands.
+    neutral = predict_market(session, scorer=_FixedScorer(), on_date=D)
+    neutral_index = float(neutral.sentiment_index)
+    boosted = predict_market(
+        session, scorer=_FixedScorer(), on_date=D,
+        source_weights={"Reuters": 4.0, "WSJ": 1.0},
+    )
+    # Neutral run: rough cancellation, near-zero index.
+    assert abs(neutral_index) < 0.2
+    # Boosted run: Reuters dominates, positive index.
+    assert boosted.sentiment_index > 0.3
+    assert boosted.label == "UP"
+
+
+def test_predict_market_half_life_changes_index(session) -> None:
+    """A short half-life weights recent articles more heavily."""
+    from tests.conftest import make_article as _ma
+    early = _ma(finnhub_id=20, headline="early-neg",
+                published_at=datetime(2026, 5, 19, 1, tzinfo=timezone.utc))
+    late = _ma(finnhub_id=21, headline="late-pos",
+               published_at=datetime(2026, 5, 19, 22, tzinfo=timezone.utc))
+    third = _ma(finnhub_id=22, headline="another-late",
+                published_at=datetime(2026, 5, 19, 23, tzinfo=timezone.utc))
+    upsert_articles(session, [early, late, third])
+    persisted = session.query(type(early)).order_by(type(early).finnhub_id).all()
+    save_scores(
+        session,
+        [
+            make_score(persisted[0].id, -0.9, model_version="vader-test"),
+            make_score(persisted[1].id, 0.9, model_version="vader-test"),
+            make_score(persisted[2].id, 0.9, model_version="vader-test"),
+        ],
+    )
+
+    # Same upsert caveat as the source_weights test: snapshot the first
+    # call's index before the second overwrites it.
+    long_hl = predict_market(
+        session, scorer=_FixedScorer(), on_date=D,
+        half_life_hours=200.0,  # essentially no decay
+    )
+    long_index = float(long_hl.sentiment_index)
+    short_hl = predict_market(
+        session, scorer=_FixedScorer(), on_date=D,
+        half_life_hours=3.0,    # heavy decay
+    )
+    # Short half-life weights the late positives more — higher index.
+    assert short_hl.sentiment_index > long_index
+
+
 def test_predict_market_with_real_vader(session) -> None:
     """End-to-end sanity check using the real VaderScorer."""
     scorer = VaderScorer()

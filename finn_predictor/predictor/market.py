@@ -58,13 +58,21 @@ def predict_market(
     article_symbol: Optional[str] = None,
     threshold_sigma: Optional[float] = None,
     min_baseline_sigma: Optional[float] = None,
+    half_life_hours: Optional[float] = None,
+    source_weights: Optional[dict[str, float]] = None,
 ) -> Optional[Prediction]:
     """Compute and persist a whole-market prediction for ``on_date``.
 
-    ``threshold_sigma`` and ``min_baseline_sigma`` default to the
-    module-level constants but can be overridden — the learning loop
-    sweeps over them and the live caller can read them from
-    :func:`finn_predictor.learning.active_weights`.
+    Every knob that the learning loop fits can be overridden here:
+
+    * ``threshold_sigma`` — z-score cut between FLAT and UP/DOWN.
+    * ``min_baseline_sigma`` — floor on the rolling baseline's σ.
+    * ``half_life_hours`` — recency decay constant for per-article weights.
+    * ``source_weights`` — per-source multiplier applied on top of recency.
+
+    Defaults match the hand-tuned module constants so callers that
+    don't care can ignore the new arguments. The daily ingest job pulls
+    all four from :func:`finn_predictor.learning.active_weights`.
 
     Returns the saved :class:`Prediction` (or ``None`` if there's not enough
     data even to call FLAT — i.e. zero articles).
@@ -74,6 +82,7 @@ def predict_market(
     floor = (
         min_baseline_sigma if min_baseline_sigma is not None else MIN_BASELINE_SIGMA
     )
+    half_life = half_life_hours if half_life_hours is not None else 12.0
 
     today = daily_sentiment_index(
         session,
@@ -81,6 +90,8 @@ def predict_market(
         day=on_date,
         category=category,
         symbol=article_symbol,
+        half_life_hours=half_life,
+        source_weights=source_weights,
     )
     if today.is_empty:
         logger.info("no articles for %s — skipping prediction", on_date.date())
@@ -92,6 +103,8 @@ def predict_market(
         end_day=on_date,
         category=category,
         symbol=article_symbol,
+        half_life_hours=half_life,
+        source_weights=source_weights,
     )
     sigma = max(base.stddev, floor)
     z = (today.weighted_mean - base.mean) / sigma

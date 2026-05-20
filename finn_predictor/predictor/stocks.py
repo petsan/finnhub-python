@@ -31,8 +31,16 @@ def predict_stock(
     scorer: Scorer,
     symbol: str,
     on_date: datetime | None = None,
+    threshold_sigma: Optional[float] = None,
+    min_baseline_sigma: Optional[float] = None,
+    half_life_hours: Optional[float] = None,
+    source_weights: Optional[dict[str, float]] = None,
 ) -> Optional[Prediction]:
     """Compute and persist a per-ticker directional call.
+
+    All four learnable parameters forward to :func:`predict_market`;
+    pass them explicitly when you want a per-call override of the
+    active learned weights.
 
     Returns ``None`` if no scored articles exist for ``symbol`` in the
     target day — matches the market predictor's "not enough data" path.
@@ -46,6 +54,10 @@ def predict_stock(
         symbol=symbol,
         category="company",
         article_symbol=symbol,
+        threshold_sigma=threshold_sigma,
+        min_baseline_sigma=min_baseline_sigma,
+        half_life_hours=half_life_hours,
+        source_weights=source_weights,
     )
 
 
@@ -55,6 +67,10 @@ def predict_all_stocks(
     scorer: Scorer,
     symbols: Iterable[str],
     on_date: datetime | None = None,
+    threshold_sigma: Optional[float] = None,
+    min_baseline_sigma: Optional[float] = None,
+    half_life_hours: Optional[float] = None,
+    source_weights: Optional[dict[str, float]] = None,
 ) -> list[Prediction]:
     """Run :func:`predict_stock` across a list of tickers.
 
@@ -65,7 +81,13 @@ def predict_all_stocks(
     for sym in symbols:
         if not sym:
             continue
-        pred = predict_stock(session, scorer=scorer, symbol=sym, on_date=on_date)
+        pred = predict_stock(
+            session, scorer=scorer, symbol=sym, on_date=on_date,
+            threshold_sigma=threshold_sigma,
+            min_baseline_sigma=min_baseline_sigma,
+            half_life_hours=half_life_hours,
+            source_weights=source_weights,
+        )
         if pred is not None:
             out.append(pred)
     return out

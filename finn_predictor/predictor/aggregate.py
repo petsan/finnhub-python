@@ -117,11 +117,19 @@ def daily_sentiment_index(
     symbol: Optional[str] = None,
     category: Optional[str] = "general",
     half_life_hours: float = 12.0,
+    source_weights: Optional[dict[str, float]] = None,
 ) -> SentimentSummary:
     """Aggregate sentiment for one UTC day.
 
     ``symbol``/``category`` filter the article set; defaults select the
     whole-market ``general`` feed.
+
+    ``source_weights`` is an optional per-source multiplier (e.g.
+    ``{"Reuters": 1.3, "WSJ": 0.7}``) applied **on top of** the recency
+    weight before the weighted mean is computed. Sources not in the map
+    keep weight 1.0. This is the live-scoring counterpart to the same
+    knob in :mod:`learning.simulate` — when the learning loop fits a
+    set of source weights, the daily ingest passes them through here.
     """
     start, end = utc_day_window(day)
     articles = articles_in_window(
@@ -131,9 +139,12 @@ def daily_sentiment_index(
     if not paired:
         return EMPTY_SUMMARY
 
+    sw = source_weights or {}
     scores = [s for _, s in paired]
     weights = [
-        _recency_weight(a.published_at, end, half_life_hours) for a, _ in paired
+        _recency_weight(a.published_at, end, half_life_hours)
+        * sw.get((a.source or "").strip(), 1.0)
+        for a, _ in paired
     ]
     return aggregate_sentiment(scores, weights=weights)
 
@@ -146,8 +157,17 @@ def rolling_baseline(
     window_days: int = 30,
     symbol: Optional[str] = None,
     category: Optional[str] = "general",
+    half_life_hours: float = 12.0,
+    source_weights: Optional[dict[str, float]] = None,
 ) -> SentimentSummary:
-    """Mean/stddev of daily indices over the trailing window."""
+    """Mean/stddev of daily indices over the trailing window.
+
+    ``half_life_hours`` and ``source_weights`` are forwarded to each
+    inner :func:`daily_sentiment_index` call so the baseline reflects
+    the same scoring config the caller is about to compare against.
+    Otherwise the baseline would silently float against the default
+    config even after the learner activated new weights.
+    """
     daily_means: list[float] = []
     for i in range(1, window_days + 1):
         day = end_day - timedelta(days=i)
@@ -157,6 +177,8 @@ def rolling_baseline(
             day=day,
             symbol=symbol,
             category=category,
+            half_life_hours=half_life_hours,
+            source_weights=source_weights,
         )
         if not summary.is_empty:
             daily_means.append(summary.weighted_mean)

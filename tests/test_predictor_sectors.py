@@ -123,9 +123,62 @@ def test_predict_all_sectors_skips_sectors_without_universe(session) -> None:
 
 
 def test_predict_all_sectors_empty_when_no_universe(session) -> None:
+    """No explicit universe AND no cached ETF_HOLDING rows → no predictions."""
     ensure_default_sectors(session)
     out = predict_all_sectors(session, scorer=_FixedScorer(), on_date=D)
     assert out == []
+
+
+def test_predict_all_sectors_reads_universe_from_db(session) -> None:
+    """When sector_universe is None, predict_all_sectors pulls
+    constituent tickers from the cached ETF_HOLDING relationship rows.
+
+    This is the wiring that makes 'click Refresh constituents once,
+    then sector predictions appear in every subsequent daily ingest'
+    work."""
+    from finn_predictor.storage.repo import upsert_related_entity
+
+    ensure_default_sectors(session)
+
+    # Cache AAPL as an XLK constituent and seed company news for it.
+    upsert_related_entity(
+        session, source_symbol="XLK", related_symbol="AAPL",
+        relationship="ETF_HOLDING", rank=0,
+    )
+    _seed_company_articles(session, symbol="AAPL", scores=[0.8, 0.7, 0.85])
+
+    out = predict_all_sectors(
+        session,
+        scorer=_FixedScorer(),
+        on_date=D,
+        # No sector_universe arg — the function should read from the DB.
+    )
+    targets = {p.target_symbol for p in out}
+    assert "XLK" in targets
+
+
+def test_predict_all_sectors_explicit_universe_overrides_db(session) -> None:
+    """An explicit dict still wins even when the DB also has rows."""
+    from finn_predictor.storage.repo import upsert_related_entity
+
+    ensure_default_sectors(session)
+    # Cache MSFT in XLK in the DB
+    upsert_related_entity(
+        session, source_symbol="XLK", related_symbol="MSFT",
+        relationship="ETF_HOLDING", rank=0,
+    )
+    # Seed AAPL articles, NOT MSFT — so if the DB universe is used the
+    # call produces nothing; if the explicit override is used it
+    # produces XLK with AAPL articles.
+    _seed_company_articles(session, symbol="AAPL", scores=[0.8, 0.7, 0.85])
+
+    out = predict_all_sectors(
+        session,
+        scorer=_FixedScorer(),
+        on_date=D,
+        sector_universe={"TECH": ["AAPL"]},
+    )
+    assert {p.target_symbol for p in out} == {"XLK"}
 
 
 def test_predict_sector_emits_flat_below_min_articles(session) -> None:

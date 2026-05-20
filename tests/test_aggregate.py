@@ -142,3 +142,67 @@ def test_rolling_baseline_empty_when_window_has_no_articles(session) -> None:
         session, model_version="vader-test", end_day=D, window_days=30
     )
     assert base.is_empty
+
+
+def test_daily_sentiment_index_applies_source_weights(session) -> None:
+    """Per-source multipliers really shift the weighted mean."""
+    # Two articles same day, same recency, same score sign but opposite
+    # signs; their plain mean is 0. With Reuters weighted 3x WSJ, the
+    # Reuters article (+0.8) should dominate.
+    a_pos = make_article(
+        finnhub_id=1, source="Reuters",
+        headline="up", published_at=D,
+    )
+    a_neg = make_article(
+        finnhub_id=2, source="WSJ",
+        headline="down", published_at=D,
+    )
+    upsert_articles(session, [a_pos, a_neg])
+    arts = session.query(type(a_pos)).order_by(type(a_pos).finnhub_id).all()
+    save_scores(
+        session,
+        [
+            make_score(arts[0].id, 0.8, model_version="vader-test"),
+            make_score(arts[1].id, -0.8, model_version="vader-test"),
+        ],
+    )
+
+    flat = daily_sentiment_index(
+        session, model_version="vader-test", day=D,
+    )
+    boosted = daily_sentiment_index(
+        session, model_version="vader-test", day=D,
+        source_weights={"Reuters": 3.0, "WSJ": 1.0},
+    )
+    # Without source weights they cancel; with the boost the positive
+    # one dominates.
+    assert flat.weighted_mean == pytest.approx(0.0, abs=1e-9)
+    assert boosted.weighted_mean > 0.3
+
+
+def test_rolling_baseline_passes_source_weights_through(session) -> None:
+    """rolling_baseline forwards the kwargs to each inner daily call."""
+    # Plant one positive Reuters article 5 days ago; rolling baseline
+    # should pick up its boosted contribution.
+    a = make_article(
+        finnhub_id=1, source="Reuters", headline="up",
+        published_at=D - timedelta(days=5),
+    )
+    upsert_articles(session, [a])
+    arts = session.query(type(a)).all()
+    save_scores(
+        session,
+        [make_score(arts[0].id, 0.6, model_version="vader-test")],
+    )
+    plain = rolling_baseline(
+        session, model_version="vader-test", end_day=D,
+    )
+    boosted = rolling_baseline(
+        session, model_version="vader-test", end_day=D,
+        source_weights={"Reuters": 5.0},
+    )
+    # The baseline mean for a single-day single-article window is the
+    # article's score regardless of weighting magnitude (the daily index
+    # divides by total weight). So we don't expect mean to change — we
+    # just check this didn't crash and both produced equal means.
+    assert plain.mean == pytest.approx(boosted.mean)

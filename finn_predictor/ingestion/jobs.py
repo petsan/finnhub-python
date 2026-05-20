@@ -136,17 +136,32 @@ def run_daily_ingest(
     counts["scored"] = score_pending_articles(session, scorer)
 
     # Load active learned weights once and pass through to every predictor.
+    # All four knobs the learning loop fits — threshold, σ floor,
+    # half-life, per-source multipliers — are honoured here. Without
+    # this plumbing, "self-improvement" would persist new weights and
+    # then never actually use the half-life or source weights at live
+    # scoring time.
     weights = active_weights(session)
+    learned_kwargs = dict(
+        threshold_sigma=weights.threshold_sigma,
+        min_baseline_sigma=weights.min_baseline_sigma,
+        half_life_hours=weights.half_life_hours,
+        source_weights=weights.source_weights,
+    )
 
     market_pred = predict_market(
         session, scorer=scorer, on_date=today, symbol=market_symbol,
-        threshold_sigma=weights.threshold_sigma,
-        min_baseline_sigma=weights.min_baseline_sigma,
+        **learned_kwargs,
     )
     if market_pred is not None:
         counts["predictions"] = int(counts["predictions"]) + 1
 
-    sector_preds = predict_all_sectors(session, scorer=scorer, on_date=today)
+    # sector_universe=None means "read cached ETF_HOLDING rows from the
+    # DB". Sectors without cached constituents (i.e. nobody has clicked
+    # *Refresh constituents* in the Focus tab) are skipped silently.
+    sector_preds = predict_all_sectors(
+        session, scorer=scorer, on_date=today, **learned_kwargs,
+    )
     counts["predictions"] = int(counts["predictions"]) + len(sector_preds)
 
     # Per-stock predictions for every ticker the user supplied to
@@ -154,7 +169,8 @@ def run_daily_ingest(
     # target_symbol=<ticker> so the existing upsert (one row per
     # ticker per day per model) applies.
     stock_preds = predict_all_stocks(
-        session, scorer=scorer, symbols=list(company_symbols), on_date=today
+        session, scorer=scorer, symbols=list(company_symbols), on_date=today,
+        **learned_kwargs,
     )
     counts["predictions"] = int(counts["predictions"]) + len(stock_preds)
 
