@@ -22,6 +22,10 @@ from finn_predictor.ui.app import (
     _parse_symbols,
     attach_first_seen,
     build_contribution_chart,
+    build_cum_pnl_chart,
+    build_hit_rate_by_kind_chart,
+    build_hit_rate_by_label_chart,
+    build_rolling_hit_chart,
     contribution_chart_data,
     headlines_from_contributions,
     latest_market_prediction,
@@ -31,6 +35,7 @@ from finn_predictor.ui.app import (
     recent_headlines,
     run_backfill_with_key,
     run_ingestion_with_key,
+    run_price_backfill,
     sector_grid,
     stock_predictions_table,
 )
@@ -302,6 +307,120 @@ def test_stock_predictions_table_empty_returns_typed_frame(session) -> None:
     assert df.empty
     for col in ("Company", "Ticker", "Call", "Confidence", "Articles", "Sentiment"):
         assert col in df.columns
+
+
+# ---------------- price backfill + Performance charts ----------------
+
+
+def test_run_price_backfill_pulls_targets_and_scores(session) -> None:
+    """run_price_backfill collects distinct prediction targets, calls the
+    yfinance fetcher, then runs the backtester to populate outcomes."""
+    from finn_predictor.storage.models import PriceBar
+    from finn_predictor.storage.repo import save_prediction
+
+    # Predict on AAPL + ^GSPC; targets passed to the fetcher should
+    # include both (plus an auto-^GSPC entry).
+    save_prediction(
+        session,
+        make_prediction(target_symbol="AAPL", prediction_date=D, label="UP"),
+    )
+    save_prediction(
+        session,
+        make_prediction(target_symbol="^GSPC", prediction_date=D, label="UP"),
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_history(symbols, start, end):
+        captured["symbols"] = list(symbols)
+        # Return a single-ticker flat frame to keep the test tight.
+        import pandas as pd
+        idx = pd.DatetimeIndex(
+            [D + timedelta(days=1), D + timedelta(days=2)]
+        )
+        df = pd.DataFrame(
+            {"Open": [100, 101], "High": [101, 102], "Low": [99, 100],
+             "Close": [100.5, 101.5], "Volume": [1, 1]},
+            index=idx,
+        )
+        # multi-index single ticker, when we have multiple symbols
+        if len(symbols) > 1:
+            return pd.concat({s: df for s in symbols}, axis=1)
+        return df
+
+    out = run_price_backfill(session, days=30, history_fn=fake_history)
+    assert {"^GSPC", "AAPL"}.issubset(set(captured["symbols"]))
+    # Bars should have landed.
+    assert session.query(PriceBar).count() > 0
+    # And the backtester ran.
+    assert hasattr(out["scored"], "scored")
+
+
+def test_run_price_backfill_with_no_predictions_still_pulls_gspc(session) -> None:
+    """Even on an empty DB we backfill ^GSPC so the market predictor has data."""
+    captured: dict[str, object] = {}
+
+    def fake_history(symbols, start, end):
+        captured["symbols"] = list(symbols)
+        import pandas as pd
+        return pd.DataFrame(
+            columns=["Open", "High", "Low", "Close", "Volume"]
+        )
+
+    run_price_backfill(session, days=14, history_fn=fake_history)
+    assert "^GSPC" in captured["symbols"]
+
+
+def test_build_cum_pnl_chart_returns_valid_spec() -> None:
+    df = pd.DataFrame(
+        [
+            {"entry_date": D, "target_kind": "MARKET", "target_symbol": "^GSPC",
+             "pnl_pct": 0.01, "cum_pnl_pct": 0.01},
+            {"entry_date": D + timedelta(days=1), "target_kind": "MARKET",
+             "target_symbol": "^GSPC", "pnl_pct": -0.005, "cum_pnl_pct": 0.005},
+        ]
+    )
+    spec = build_cum_pnl_chart(df).to_dict()
+    assert spec["mark"]["type"] == "line"
+    assert spec["encoding"]["x"]["field"] == "entry_date"
+    assert spec["encoding"]["y"]["field"] == "cum_pnl_pct"
+
+
+def test_build_rolling_hit_chart_has_reference_line() -> None:
+    df = pd.DataFrame(
+        [
+            {"entry_date": D, "hit_rate": 0.6},
+            {"entry_date": D + timedelta(days=1), "hit_rate": 0.55},
+        ]
+    )
+    spec = build_rolling_hit_chart(df, window=14).to_dict()
+    # Combination chart → 'layer' contains the line + 50% reference rule.
+    assert "layer" in spec
+    assert len(spec["layer"]) == 2
+
+
+def test_build_hit_rate_by_kind_chart_has_bar_mark() -> None:
+    df = pd.DataFrame(
+        [
+            {"target_kind": "MARKET", "trades": 10, "hits": 6, "hit_rate": 0.6},
+            {"target_kind": "STOCK",  "trades": 20, "hits": 9, "hit_rate": 0.45},
+        ]
+    )
+    spec = build_hit_rate_by_kind_chart(df).to_dict()
+    assert spec["mark"]["type"] == "bar"
+    assert spec["encoding"]["x"]["field"] == "target_kind"
+
+
+def test_build_hit_rate_by_label_chart_sort_order() -> None:
+    df = pd.DataFrame(
+        [
+            {"label": "DOWN", "trades": 5, "hits": 3, "hit_rate": 0.6},
+            {"label": "UP",   "trades": 8, "hits": 4, "hit_rate": 0.5},
+            {"label": "FLAT", "trades": 3, "hits": 2, "hit_rate": 0.66},
+        ]
+    )
+    spec = build_hit_rate_by_label_chart(df).to_dict()
+    assert spec["encoding"]["x"]["sort"] == ["UP", "FLAT", "DOWN"]
 
 
 # ---------------- contribution chart ----------------

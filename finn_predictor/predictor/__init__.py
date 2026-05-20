@@ -24,15 +24,33 @@ from finn_predictor.predictor.stocks import (
     retroactive_predict_many,
     retroactive_predict_stock,
 )
+from finn_predictor.predictor.trades import (
+    PerformanceSummary,
+    TradeRecord,
+    cumulative_pnl_series,
+    hit_rate_by_label,
+    hit_rate_by_target_kind,
+    hypothetical_trades,
+    performance_summary,
+    rolling_hit_rate,
+    trades_dataframe,
+)
 
 __all__ = [
     "ArticleContribution",
+    "PerformanceSummary",
     "SentimentSummary",
+    "TradeRecord",
     "aggregate_sentiment",
     "article_contributions",
     "classify",
+    "cumulative_pnl_series",
     "daily_sentiment_index",
     "explain_prediction",
+    "hit_rate_by_label",
+    "hit_rate_by_target_kind",
+    "hypothetical_trades",
+    "performance_summary",
     "predict_all_sectors",
     "predict_all_stocks",
     "predict_market",
@@ -41,4 +59,6 @@ __all__ = [
     "retroactive_predict_many",
     "retroactive_predict_stock",
     "rolling_baseline",
+    "rolling_hit_rate",
+    "trades_dataframe",
 ]

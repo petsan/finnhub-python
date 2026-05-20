@@ -33,12 +33,28 @@ from finn_predictor.ingestion.client import (
     scrub_token,
 )
 from finn_predictor.ingestion.jobs import run_daily_ingest, score_pending_articles
+from finn_predictor.ingestion.prices_yf import (
+    PriceBackfillResult,
+    backfill_prices_yf,
+)
+from finn_predictor.predictor.backtest import score_outcomes
 from finn_predictor.predictor.explain import (
     ArticleContribution,
     article_contributions,
     explain_prediction,
 )
 from finn_predictor.predictor.stocks import retroactive_predict_many
+from finn_predictor.predictor.trades import (
+    PerformanceSummary,
+    TradeRecord,
+    cumulative_pnl_series,
+    hit_rate_by_label,
+    hit_rate_by_target_kind,
+    hypothetical_trades,
+    performance_summary,
+    rolling_hit_rate,
+    trades_dataframe,
+)
 from finn_predictor.sentiment.vader import VaderScorer
 from finn_predictor.storage import create_engine_and_session, init_db
 from finn_predictor.storage.models import (
@@ -556,6 +572,156 @@ def run_ingestion_with_key(
     return counts
 
 
+def run_price_backfill(
+    session: Session,
+    *,
+    days: int = 90,
+    history_fn=None,
+) -> dict[str, object]:
+    """Backfill yfinance prices for every prediction target + score outcomes.
+
+    Pulls daily OHLC for ``^GSPC`` and every distinct ``target_symbol``
+    already in the ``predictions`` table, then runs the backtester so
+    ``prediction_outcomes`` populates for any predictions whose next
+    bar is now available.
+
+    No API key needed — yfinance hits Yahoo's public endpoints. The
+    ``history_fn`` injection point is for tests; production callers
+    leave it None.
+
+    Returns ``{"backfill": PriceBackfillResult, "scored": BacktestReport}``.
+    """
+    targets = set(
+        s for (s,) in session.execute(
+            select(Prediction.target_symbol).distinct()
+        ).all()
+    )
+    # Always include ^GSPC even if we haven't predicted it yet — it's
+    # the headline target.
+    targets.add("^GSPC")
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+
+    backfill_kwargs: dict[str, object] = {
+        "symbols": sorted(targets),
+        "start": start,
+        "end": end,
+    }
+    if history_fn is not None:
+        backfill_kwargs["history_fn"] = history_fn
+
+    bf = backfill_prices_yf(session, **backfill_kwargs)
+    scored = score_outcomes(session)
+    return {"backfill": bf, "scored": scored}
+
+
+def build_cum_pnl_chart(df: pd.DataFrame) -> alt.Chart:
+    """Cumulative-PnL line chart with target_kind colour breakdown."""
+    return (
+        alt.Chart(df)
+        .mark_line(point=False)
+        .encode(
+            x=alt.X("entry_date:T", axis=alt.Axis(title="prediction date")),
+            y=alt.Y(
+                "cum_pnl_pct:Q",
+                axis=alt.Axis(title="cumulative PnL %", format="+.1%"),
+            ),
+            tooltip=[
+                alt.Tooltip("entry_date:T", title="Date"),
+                alt.Tooltip("target_symbol:N", title="Target"),
+                alt.Tooltip("pnl_pct:Q", title="Trade PnL", format="+.2%"),
+                alt.Tooltip("cum_pnl_pct:Q", title="Cumulative", format="+.2%"),
+            ],
+        )
+        .properties(height=260)
+    )
+
+
+def build_rolling_hit_chart(df: pd.DataFrame, window: int) -> alt.Chart:
+    """Rolling hit-rate line chart with a 50% reference rule."""
+    base = alt.Chart(df)
+    line = base.mark_line().encode(
+        x=alt.X("entry_date:T", axis=alt.Axis(title="prediction date")),
+        y=alt.Y(
+            "hit_rate:Q",
+            scale=alt.Scale(domain=[0, 1]),
+            axis=alt.Axis(title=f"{window}-trade rolling hit-rate", format=".0%"),
+        ),
+        tooltip=[
+            alt.Tooltip("entry_date:T", title="Date"),
+            alt.Tooltip("hit_rate:Q", title="Hit rate", format=".1%"),
+        ],
+    )
+    # Coin-flip reference line at 50%
+    ref = alt.Chart(pd.DataFrame({"y": [0.5]})).mark_rule(
+        strokeDash=[4, 4], color="#9aa0a6"
+    ).encode(y="y:Q")
+    return (line + ref).properties(height=260)
+
+
+def build_hit_rate_by_kind_chart(df: pd.DataFrame) -> alt.Chart:
+    """Bar chart of hit-rate per target_kind (MARKET / SECTOR / STOCK)."""
+    return (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X("target_kind:N", title="target type"),
+            y=alt.Y(
+                "hit_rate:Q",
+                scale=alt.Scale(domain=[0, 1]),
+                axis=alt.Axis(format=".0%", title="hit rate"),
+            ),
+            color=alt.Color(
+                "target_kind:N",
+                legend=None,
+                scale=alt.Scale(
+                    domain=["MARKET", "SECTOR", "STOCK"],
+                    range=["#1f77b4", "#2ca02c", "#ff7f0e"],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("target_kind:N", title="Target type"),
+                alt.Tooltip("trades:Q", title="Closed trades"),
+                alt.Tooltip("hits:Q", title="Wins"),
+                alt.Tooltip("hit_rate:Q", title="Hit rate", format=".1%"),
+            ],
+        )
+        .properties(height=220)
+    )
+
+
+def build_hit_rate_by_label_chart(df: pd.DataFrame) -> alt.Chart:
+    """Bar chart of hit-rate per UP/DOWN/FLAT label."""
+    return (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X("label:N", sort=["UP", "FLAT", "DOWN"], title="call"),
+            y=alt.Y(
+                "hit_rate:Q",
+                scale=alt.Scale(domain=[0, 1]),
+                axis=alt.Axis(format=".0%", title="hit rate"),
+            ),
+            color=alt.Color(
+                "label:N",
+                legend=None,
+                scale=alt.Scale(
+                    domain=["UP", "FLAT", "DOWN"],
+                    range=["#2ca02c", "#9aa0a6", "#d62728"],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("label:N", title="Call"),
+                alt.Tooltip("trades:Q", title="Total"),
+                alt.Tooltip("hits:Q", title="Hits"),
+                alt.Tooltip("hit_rate:Q", title="Hit rate", format=".1%"),
+            ],
+        )
+        .properties(height=220)
+    )
+
+
 def run_backfill_with_key(
     session: Session,
     *,
@@ -640,6 +806,8 @@ class _SidebarState:
     backfill_triggered_key: str | None
     backfill_tickers_csv: str
     backfill_lookback_days: int
+    price_backfill_triggered: bool
+    price_backfill_days: int
 
 
 def _render_sidebar() -> _SidebarState:  # pragma: no cover - Streamlit UI
@@ -709,6 +877,25 @@ def _render_sidebar() -> _SidebarState:  # pragma: no cover - Streamlit UI
             help="Requires a key + at least one ticker.",
         )
 
+        st.divider()
+        st.subheader("Backfill prices (yfinance)")
+        st.caption(
+            "Pulls daily OHLC from Yahoo Finance for every prediction "
+            "target in the DB and scores any predictions whose next-"
+            "session close is now available. No API key needed — fills "
+            "the gap left by Finnhub's gated `/stock/candle`. Drives the "
+            "*Performance* tab's hit-rate and cumulative-PnL curves."
+        )
+        price_backfill_days = st.slider(
+            "Price lookback (days)",
+            min_value=14,
+            max_value=730,
+            value=180,
+            step=1,
+            key="price_lookback_slider",
+        )
+        price_backfill_clicked = st.button("Backfill prices")
+
     triggered = current if (current and run_clicked) else None
     backfill_key = current if (current and backfill_clicked) else None
     return _SidebarState(
@@ -717,6 +904,8 @@ def _render_sidebar() -> _SidebarState:  # pragma: no cover - Streamlit UI
         backfill_triggered_key=backfill_key,
         backfill_tickers_csv=backfill_tickers_csv,
         backfill_lookback_days=backfill_lookback_days,
+        price_backfill_triggered=bool(price_backfill_clicked),
+        price_backfill_days=price_backfill_days,
     )
 
 
@@ -740,6 +929,33 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
     symbols_csv = sidebar.symbols_csv
 
     with SessionLocal() as session:
+        if sidebar.price_backfill_triggered:
+            with st.spinner(
+                f"Backfilling prices for the last "
+                f"{sidebar.price_backfill_days} days…"
+            ):
+                try:
+                    out = run_price_backfill(
+                        session, days=sidebar.price_backfill_days
+                    )
+                except Exception as exc:
+                    st.sidebar.error(f"Price backfill failed: {exc}")
+                else:
+                    bf: PriceBackfillResult = out["backfill"]
+                    bt = out["scored"]
+                    st.sidebar.success(
+                        f"Prices done — bars +{bf.bars_inserted} "
+                        f"({bf.symbols_with_data}/{bf.symbols_requested} symbols), "
+                        f"outcomes +{bt.scored} (hits {bt.hits})"
+                    )
+                    if bf.failures:
+                        with st.sidebar.expander(
+                            f"⚠ {len(bf.failures)} price failure(s)",
+                            expanded=False,
+                        ):
+                            for f in bf.failures:
+                                st.write(f"**`{f.get('symbol', '*')}`** — {f.get('error', '')}")
+
         if sidebar.backfill_triggered_key:
             backfill_syms = _parse_symbols(sidebar.backfill_tickers_csv)
             today_utc = datetime.now(timezone.utc)
@@ -858,8 +1074,8 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                     st.sidebar.error(f"Ingestion failed: {msg}")
 
         st.title("Finn-Predictor")
-        tab_today, tab_history, tab_sectors = st.tabs(
-            ["Today", "History", "Sectors"]
+        tab_today, tab_history, tab_sectors, tab_performance = st.tabs(
+            ["Today", "History", "Sectors", "Performance"]
         )
 
         with tab_today:
@@ -1017,6 +1233,127 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                 st.write("Sectors not seeded yet — run an ingestion cycle.")
             else:
                 st.dataframe(grid, use_container_width=True)
+
+        # --- Performance tab (hypothetical-trade accuracy + PnL) ---
+        with tab_performance:
+            trades = hypothetical_trades(session)
+            summary = performance_summary(trades)
+
+            st.caption(
+                "Each prediction is treated as a paper trade: **UP → long** "
+                "the target at the prediction-day close, **DOWN → short**, "
+                "**FLAT → no trade**. Exit is the next session's close. "
+                "Hit rate uses the backtester's sign-of-direction rule "
+                "(|return| < 0.25% counts as a FLAT hit)."
+            )
+
+            if summary.closed_trades == 0 and summary.open_trades == 0:
+                st.info(
+                    "No predictions yet. Run an ingestion or a backfill "
+                    "from the sidebar to populate this tab."
+                )
+            elif summary.closed_trades == 0:
+                st.warning(
+                    f"{summary.open_trades} open prediction(s) — no "
+                    "outcomes yet. Click *Backfill prices* in the sidebar "
+                    "to pull historical OHLC and score them."
+                )
+
+            # --- Summary metrics row ---
+            cols = st.columns(5)
+            cols[0].metric("Predictions", summary.total_predictions)
+            cols[1].metric("Closed trades", summary.closed_trades)
+            cols[2].metric(
+                "Hit rate",
+                f"{summary.hit_rate:.1%}" if summary.closed_trades else "—",
+            )
+            cols[3].metric(
+                "Cumulative PnL",
+                f"{summary.cumulative_pnl_pct:+.2%}" if summary.closed_trades else "—",
+            )
+            cols[4].metric(
+                "Avg PnL / trade",
+                f"{summary.avg_pnl_per_trade_pct:+.3%}" if summary.closed_trades else "—",
+            )
+
+            if summary.closed_trades:
+                cols2 = st.columns(3)
+                cols2[0].metric(
+                    "Best trade",
+                    f"{summary.best_trade_pnl_pct:+.2%}" if summary.best_trade_pnl_pct is not None else "—",
+                )
+                cols2[1].metric(
+                    "Worst trade",
+                    f"{summary.worst_trade_pnl_pct:+.2%}" if summary.worst_trade_pnl_pct is not None else "—",
+                )
+                cols2[2].metric(
+                    "Open positions", summary.open_trades
+                )
+
+            # --- Cumulative PnL chart ---
+            cum_df = cumulative_pnl_series(trades)
+            if not cum_df.empty:
+                st.subheader("Cumulative PnL over time")
+                st.altair_chart(
+                    build_cum_pnl_chart(cum_df), use_container_width=True
+                )
+
+            # --- Rolling hit-rate ---
+            rolling_df = rolling_hit_rate(trades, window=14)
+            if not rolling_df.empty:
+                st.subheader("Rolling 14-trade hit-rate")
+                st.altair_chart(
+                    build_rolling_hit_chart(rolling_df, window=14),
+                    use_container_width=True,
+                )
+
+            # --- Per-target-kind + per-label breakdowns ---
+            kind_df = hit_rate_by_target_kind(trades)
+            label_df = hit_rate_by_label(trades)
+            if not kind_df.empty or not label_df.empty:
+                cols3 = st.columns(2)
+                with cols3[0]:
+                    st.subheader("Hit rate by target type")
+                    if kind_df.empty:
+                        st.write("No closed directional trades yet.")
+                    else:
+                        st.altair_chart(
+                            build_hit_rate_by_kind_chart(kind_df),
+                            use_container_width=True,
+                        )
+                with cols3[1]:
+                    st.subheader("Hit rate by Call")
+                    if label_df.empty:
+                        st.write("No closed trades yet.")
+                    else:
+                        st.altair_chart(
+                            build_hit_rate_by_label_chart(label_df),
+                            use_container_width=True,
+                        )
+
+            # --- Trade ledger ---
+            if trades:
+                st.subheader("Trade ledger")
+                df = trades_dataframe(trades).sort_values(
+                    "entry_date", ascending=False
+                )
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "confidence": st.column_config.ProgressColumn(
+                            "Confidence", min_value=0.0, max_value=1.0,
+                            format="%.2f",
+                        ),
+                        "pnl_pct": st.column_config.NumberColumn(
+                            "PnL %", format="%+.2f%%",
+                        ),
+                        "realised_return": st.column_config.NumberColumn(
+                            "Next-day move", format="%+.2f%%",
+                        ),
+                    },
+                )
 
 
 if __name__ == "__main__":  # pragma: no cover
