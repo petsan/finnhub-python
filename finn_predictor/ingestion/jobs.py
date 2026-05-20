@@ -19,7 +19,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.orm import Session
 
-from finn_predictor.ingestion.client import FinnhubGateway
+from finn_predictor.ingestion.client import FinnhubGateway, IngestionError
 from finn_predictor.ingestion.news import ingest_company_news, ingest_general_news
 from finn_predictor.ingestion.prices import ingest_price_history
 from finn_predictor.predictor.market import predict_market
@@ -60,53 +60,87 @@ def run_daily_ingest(
     market_symbol: str = "^GSPC",
     company_symbols: Iterable[str] = (),
     today: datetime | None = None,
-) -> dict[str, int]:
+) -> dict[str, object]:
     """Run one end-to-end ingestion + prediction cycle.
 
-    Returns a small dict of counts for the calling job to log.
+    Resilient by design: every Finnhub call is wrapped so a single failing
+    endpoint (e.g. a 403 because the user's plan doesn't include
+    ``/stock/candle``) does not abort the rest of the run. Errors are
+    collected into ``counts["failures"]`` and surfaced to the caller —
+    already token-scrubbed by :class:`FinnhubGateway`.
+
+    Returns a dict with integer counts per category plus a ``"failures"``
+    key holding ``[{"op": str, "error": str}, ...]``.
     """
     today = today or datetime.now(timezone.utc)
     yesterday = today - timedelta(days=7)  # generous window catches weekends
 
-    counts = {
-        "general_news": ingest_general_news(session, gateway, category="general"),
+    counts: dict[str, object] = {
+        "general_news": 0,
         "company_news": 0,
-        "market_prices": ingest_price_history(
-            session, gateway, symbol=market_symbol, start=yesterday, end=today
-        ),
+        "market_prices": 0,
         "sector_prices": 0,
         "company_prices": 0,
         "scored": 0,
         "predictions": 0,
     }
+    failures: list[dict[str, str]] = []
 
-    # Iter-2 prerequisites: per-sector ETF prices + per-company news.
+    def _try(op_name: str, fn) -> int:
+        try:
+            return int(fn())
+        except IngestionError as exc:
+            failures.append({"op": op_name, "error": str(exc)})
+            return 0
+
+    counts["general_news"] = _try(
+        "general_news",
+        lambda: ingest_general_news(session, gateway, category="general"),
+    )
+    counts["market_prices"] = _try(
+        f"market_prices:{market_symbol}",
+        lambda: ingest_price_history(
+            session, gateway, symbol=market_symbol, start=yesterday, end=today
+        ),
+    )
+
+    # Iter-2 prerequisites: per-sector ETF prices.
     sectors = ensure_default_sectors(session)
     for sector in sectors:
-        counts["sector_prices"] += ingest_price_history(
-            session,
-            gateway,
-            symbol=sector.etf_symbol,
-            start=yesterday,
-            end=today,
+        counts["sector_prices"] = int(counts["sector_prices"]) + _try(
+            f"sector_prices:{sector.etf_symbol}",
+            lambda s=sector: ingest_price_history(
+                session, gateway, symbol=s.etf_symbol, start=yesterday, end=today
+            ),
         )
 
     for symbol in company_symbols:
-        counts["company_news"] += ingest_company_news(
-            session, gateway, symbol=symbol, start=yesterday, end=today
+        counts["company_news"] = int(counts["company_news"]) + _try(
+            f"company_news:{symbol}",
+            lambda sym=symbol: ingest_company_news(
+                session, gateway, symbol=sym, start=yesterday, end=today
+            ),
         )
-        counts["company_prices"] += ingest_price_history(
-            session, gateway, symbol=symbol, start=yesterday, end=today
+        counts["company_prices"] = int(counts["company_prices"]) + _try(
+            f"company_prices:{symbol}",
+            lambda sym=symbol: ingest_price_history(
+                session, gateway, symbol=sym, start=yesterday, end=today
+            ),
         )
 
+    # Scoring + predictions are DB-only operations — they always run, even if
+    # every Finnhub fetch above failed, because there may be older articles
+    # left over from a previous successful ingestion.
     counts["scored"] = score_pending_articles(session, scorer)
 
     market_pred = predict_market(session, scorer=scorer, on_date=today, symbol=market_symbol)
     if market_pred is not None:
-        counts["predictions"] += 1
+        counts["predictions"] = int(counts["predictions"]) + 1
 
     sector_preds = predict_all_sectors(session, scorer=scorer, on_date=today)
-    counts["predictions"] += len(sector_preds)
+    counts["predictions"] = int(counts["predictions"]) + len(sector_preds)
+
+    counts["failures"] = failures
     return counts
 
 

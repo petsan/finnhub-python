@@ -296,11 +296,27 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                         rate_limit_per_minute=settings.rate_limit_per_minute,
                         company_symbols=symbols,
                     )
-                    st.sidebar.success(
-                        f"Done — articles +{counts['general_news']}, "
-                        f"scored {counts['scored']}, "
-                        f"predictions {counts['predictions']}"
-                    )
+                    failures = counts.get("failures") or []
+                    if failures and counts.get("general_news", 0) == 0 and counts.get("scored", 0) == 0:
+                        # Everything failed — most likely a bad key or a fully
+                        # blocked plan. Show the first failure prominently.
+                        st.sidebar.error(
+                            "Every Finnhub call failed — "
+                            f"first error: {failures[0]['error']}"
+                        )
+                    else:
+                        st.sidebar.success(
+                            f"Done — articles +{counts['general_news']}, "
+                            f"scored {counts['scored']}, "
+                            f"predictions {counts['predictions']}"
+                        )
+                        if failures:
+                            with st.sidebar.expander(
+                                f"⚠ {len(failures)} endpoint(s) failed (expand for detail)",
+                                expanded=False,
+                            ):
+                                for f in failures:
+                                    st.write(f"**{f['op']}** — {f['error']}")
                 except Exception as exc:
                     # Triple-layer scrub: gateway + helper already replaced
                     # the token, but we run one more pass at the display
