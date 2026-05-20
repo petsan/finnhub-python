@@ -23,7 +23,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from finn_predictor.config import load_settings
-from finn_predictor.ingestion.client import FinnhubGateway, RateLimiter
+from finn_predictor.ingestion.client import (
+    FinnhubGateway,
+    IngestionError,
+    RateLimiter,
+    scrub_token,
+)
 from finn_predictor.ingestion.jobs import run_daily_ingest
 from finn_predictor.sentiment.vader import VaderScorer
 from finn_predictor.storage import create_engine_and_session, init_db
@@ -169,6 +174,12 @@ def run_ingestion_with_key(
     The key is held only inside the locally-scoped :class:`FinnhubClient` for
     the duration of this call. It is never persisted, logged, or returned in
     the result dict.
+
+    Any exception (including transport-level ``requests`` errors whose
+    messages embed the full URL with the token) is re-raised as
+    :class:`IngestionError` with the token scrubbed from the message. Use
+    ``from None`` to suppress the original chain so default tracebacks don't
+    re-leak the URL via ``__cause__``.
     """
     if not api_key or not api_key.strip():
         raise ValueError("api_key must be a non-empty string")
@@ -179,12 +190,19 @@ def run_ingestion_with_key(
             client=client,
             rate_limiter=RateLimiter(rate_limit_per_minute),
         )
-        counts = run_daily_ingest(
-            session=session,
-            gateway=gateway,
-            scorer=VaderScorer(),
-            company_symbols=list(company_symbols),
-        )
+        try:
+            counts = run_daily_ingest(
+                session=session,
+                gateway=gateway,
+                scorer=VaderScorer(),
+                company_symbols=list(company_symbols),
+            )
+        except IngestionError:
+            # Already scrubbed by the gateway — let it propagate as-is.
+            raise
+        except Exception as exc:
+            # Belt-and-braces: anything the gateway missed gets scrubbed here.
+            raise IngestionError(scrub_token(str(exc), api_key)) from None
     finally:
         # Explicitly close the requests.Session so the key-bearing connection
         # pool doesn't sit around in memory longer than needed.
@@ -276,9 +294,11 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                         f"predictions {counts['predictions']}"
                     )
                 except Exception as exc:
-                    # NB: never echo the key in errors. FinnhubAPIException
-                    # already redacts the URL; we only show the message.
-                    st.sidebar.error(f"Ingestion failed: {exc}")
+                    # Triple-layer scrub: gateway + helper already replaced
+                    # the token, but we run one more pass at the display
+                    # boundary in case any future code path adds a new leak.
+                    msg = scrub_token(str(exc), triggered_key)
+                    st.sidebar.error(f"Ingestion failed: {msg}")
 
         st.title("Finn-Predictor")
         tab_today, tab_history, tab_sectors = st.tabs(

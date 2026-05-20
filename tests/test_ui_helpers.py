@@ -165,13 +165,35 @@ def test_run_ingestion_with_key_builds_client_and_runs(session) -> None:
 
 def test_run_ingestion_with_key_closes_client_on_exception(session) -> None:
     """Even if run_daily_ingest raises, the key-bearing client must be closed."""
+    from finn_predictor.ingestion.client import IngestionError
+
     with patch("finn_predictor.ui.app.FinnhubClient") as mock_cls, patch(
         "finn_predictor.ui.app.run_daily_ingest", side_effect=RuntimeError("boom")
     ):
         client_instance = mock_cls.return_value
-        with pytest.raises(RuntimeError, match="boom"):
+        # IngestionError wraps the original; original RuntimeError doesn't escape.
+        with pytest.raises(IngestionError):
             run_ingestion_with_key(session, api_key="sk-x")
         client_instance.close.assert_called_once_with()
+
+
+def test_run_ingestion_with_key_scrubs_leaked_token_from_message(session) -> None:
+    """If anything in the pipeline leaks the api_key in an exception message,
+    run_ingestion_with_key must redact it before re-raising."""
+    from finn_predictor.ingestion.client import IngestionError, REDACTED
+
+    leaky_msg = "boom token=sk-leak-9f7c in url"
+    with patch("finn_predictor.ui.app.FinnhubClient") as mock_cls, patch(
+        "finn_predictor.ui.app.run_daily_ingest", side_effect=RuntimeError(leaky_msg)
+    ):
+        mock_cls.return_value.close = lambda: None
+        with pytest.raises(IngestionError) as excinfo:
+            run_ingestion_with_key(session, api_key="sk-leak-9f7c")
+        msg = str(excinfo.value)
+        assert "sk-leak-9f7c" not in msg
+        assert REDACTED in msg
+        # Context chain suppressed -> default tracebacks won't re-leak via __cause__.
+        assert excinfo.value.__suppress_context__ is True
 
 
 def test_api_key_is_never_persisted_to_db(session) -> None:

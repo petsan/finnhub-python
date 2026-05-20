@@ -20,6 +20,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Deque
 
+import requests
 from finnhub import Client
 from finnhub.exceptions import FinnhubAPIException
 
@@ -27,6 +28,27 @@ from finnhub.exceptions import FinnhubAPIException
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+REDACTED = "<REDACTED>"
+
+
+class IngestionError(Exception):
+    """Domain error raised after API-key scrubbing.
+
+    Always raised with the API key replaced by :data:`REDACTED`. Created with
+    ``raise IngestionError(msg) from None`` so the original exception chain
+    (which may contain the raw URL) is suppressed from default tracebacks.
+    """
+
+
+def scrub_token(text: str, token: str | None) -> str:
+    """Replace ``token`` everywhere it appears in ``text``.
+
+    Robust to ``token`` being None or empty (returns ``text`` unchanged) so
+    callers don't have to special-case the "no key yet" path.
+    """
+    if not token:
+        return text
+    return text.replace(token, REDACTED)
 
 
 class RateLimiter:
@@ -80,8 +102,33 @@ class FinnhubGateway:
     backoff_base: float = 0.5
     sleep: Callable[[float], None] = field(default=time.sleep)
 
+    def _current_token(self) -> str | None:
+        """Best-effort lookup of the active API token on the underlying client.
+
+        Returns None unless the token looks like a real non-empty string —
+        this keeps :func:`scrub_token` safe when the client is a MagicMock
+        or otherwise unconfigured.
+        """
+        try:
+            token = self.client._session.params.get("token")  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if isinstance(token, str) and token:
+            return token
+        return None
+
+    def _scrub(self, text: str) -> str:
+        return scrub_token(text, self._current_token())
+
     def _call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Invoke ``fn`` through the limiter, retrying transient failures."""
+        """Invoke ``fn`` through the limiter, retrying transient failures.
+
+        Any exception raised (Finnhub-level or transport-level) is scrubbed
+        of the API token before being re-raised as :class:`IngestionError`.
+        ``FinnhubAPIException`` is intercepted *after* the retry loop because
+        only its ``status_code`` participates in retry decisions, not the
+        leaky URL.
+        """
         attempt = 0
         while True:
             self.rate_limiter.acquire()
@@ -101,7 +148,17 @@ class FinnhubGateway:
                     self.sleep(delay)
                     attempt += 1
                     continue
-                raise
+                # FinnhubAPIException.__str__ doesn't include the URL but its
+                # .response object does (response.url). Re-raise with a
+                # scrubbed string so callers can safely log it.
+                raise IngestionError(
+                    self._scrub(f"FinnhubAPI {exc.status_code}: {exc.message}")
+                ) from None
+            except requests.exceptions.RequestException as exc:
+                # Transport-level failures (SSL, DNS, timeout, connection
+                # reset) embed the full URL — including ?token=... — in their
+                # message. Scrub before re-raising.
+                raise IngestionError(self._scrub(str(exc))) from None
 
     # --- News --------------------------------------------------------------
 
