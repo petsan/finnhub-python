@@ -165,6 +165,36 @@ class Prediction(Base):
     )
 
 
+class RelatedEntity(Base):
+    """Cached relationship from a ticker to another entity.
+
+    ``relationship`` ∈ {PEER, SUPPLIER, CUSTOMER, ETF_HOLDING}.
+    ``related_symbol`` is a ticker for everything except where Finnhub
+    returns a non-listed entity (then it's the human name).
+    """
+
+    __tablename__ = "related_entities"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_symbol",
+            "related_symbol",
+            "relationship",
+            name="uq_related_entities",
+        ),
+        Index("ix_related_entities_source", "source_symbol"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_symbol: Mapped[str] = mapped_column(String(16), nullable=False)
+    related_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    relationship: Mapped[str] = mapped_column(String(32), nullable=False)
+    rank: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    metadata_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
 class PredictionOutcome(Base):
     """The realised next-session return paired with a Prediction."""
 

@@ -7,6 +7,7 @@ from finn_predictor.storage.models import (
     PriceBar,
     Prediction,
     PredictionOutcome,
+    RelatedEntity,
     Sector,
     SentimentScore,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "PriceBar",
     "Prediction",
     "PredictionOutcome",
+    "RelatedEntity",
     "Sector",
     "SentimentScore",
     "WELL_KNOWN_NAMES",

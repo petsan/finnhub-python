@@ -43,6 +43,18 @@ from finn_predictor.predictor.explain import (
     article_contributions,
     explain_prediction,
 )
+from finn_predictor.predictor.focus import (
+    CompanyFocus,
+    EventFocus,
+    RefreshResult,
+    RelatedPrediction,
+    SectorFocus,
+    compose_company_focus,
+    compose_event_focus,
+    compose_sector_focus,
+    refresh_company_relationships,
+    refresh_sector_constituents,
+)
 from finn_predictor.predictor.stocks import retroactive_predict_many
 from finn_predictor.predictor.trades import (
     PerformanceSummary,
@@ -722,6 +734,61 @@ def build_hit_rate_by_label_chart(df: pd.DataFrame) -> alt.Chart:
     )
 
 
+def run_relationships_refresh(
+    session: Session,
+    *,
+    api_key: str,
+    company_symbols: Iterable[str] = (),
+    sector_etfs: Iterable[str] = (),
+    rate_limit_per_minute: int = 55,
+) -> dict[str, list[RefreshResult]]:
+    """Refresh peer / supply-chain / ETF-holding caches for the given symbols.
+
+    Same safety guarantees as run_ingestion_with_key:
+    short-lived FinnhubClient, ``trust_env=False``, scrubbed
+    IngestionError on any leak path.
+    """
+    if not api_key or not api_key.strip():
+        raise ValueError("api_key must be a non-empty string")
+
+    client = FinnhubClient(api_key=api_key)
+    try:
+        client._session.trust_env = False
+    except AttributeError:  # pragma: no cover
+        pass
+
+    company_results: list[RefreshResult] = []
+    sector_results: list[RefreshResult] = []
+    try:
+        gateway = FinnhubGateway(
+            client=client,
+            rate_limiter=RateLimiter(rate_limit_per_minute),
+        )
+        try:
+            for sym in company_symbols:
+                sym = sym.strip()
+                if not sym:
+                    continue
+                company_results.append(
+                    refresh_company_relationships(session, gateway, symbol=sym)
+                )
+            for etf in sector_etfs:
+                etf = etf.strip()
+                if not etf:
+                    continue
+                sector_results.append(
+                    refresh_sector_constituents(session, gateway, etf_symbol=etf)
+                )
+        except IngestionError:
+            raise
+        except Exception as exc:
+            raise IngestionError(scrub_token(str(exc), api_key)) from None
+    finally:
+        client.close()
+
+    return {"companies": company_results, "sectors": sector_results}
+
+
 def run_backfill_with_key(
     session: Session,
     *,
@@ -1074,8 +1141,14 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                     st.sidebar.error(f"Ingestion failed: {msg}")
 
         st.title("Finn-Predictor")
-        tab_today, tab_history, tab_sectors, tab_performance = st.tabs(
-            ["Today", "History", "Sectors", "Performance"]
+        (
+            tab_today,
+            tab_history,
+            tab_sectors,
+            tab_performance,
+            tab_focus,
+        ) = st.tabs(
+            ["Today", "History", "Sectors", "Performance", "Focus"]
         )
 
         with tab_today:
@@ -1354,6 +1427,350 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                         ),
                     },
                 )
+
+        # --- Focus tab ----------------------------------------------------
+        with tab_focus:
+            st.caption(
+                "Drill into a single company, sector, or current event. "
+                "For companies the view pulls in peers (and supply-chain "
+                "when your Finnhub plan supports `/stock/supply-chain`); "
+                "for sectors it lists the cached ETF constituents; for "
+                "free-text events it searches the news DB and emits an "
+                "implied Call from the aggregated sentiment."
+            )
+
+            mode = st.radio(
+                "Focus on:",
+                options=["Company", "Sector", "Event"],
+                horizontal=True,
+                key="focus_mode",
+            )
+            vader_version = VaderScorer().model_version
+
+            if mode == "Company":
+                tickers_known = sorted(
+                    {p.target_symbol for p in latest_predictions(session)
+                     if p.target_symbol != "^GSPC"}
+                )
+                col1, col2 = st.columns([3, 1])
+                ticker_input = col1.text_input(
+                    "Ticker", value=tickers_known[0] if tickers_known else "",
+                    placeholder="e.g. AAPL",
+                )
+                with col2:
+                    refresh_clicked = st.button(
+                        "Refresh peers + supply chain",
+                        disabled=not (sidebar.triggered_key or sidebar.backfill_triggered_key) and not (st.session_state.get(API_KEY_SESSION_KEY) or ""),
+                        help="Calls Finnhub to update the peer/supply-chain "
+                             "cache for this ticker. Requires a key in the sidebar.",
+                    )
+                if refresh_clicked and ticker_input:
+                    key = (st.session_state.get(API_KEY_SESSION_KEY) or "").strip()
+                    if not key:
+                        st.warning("Set the API key in the sidebar first.")
+                    else:
+                        with st.spinner(f"Refreshing {ticker_input.upper()} relationships…"):
+                            try:
+                                refresh_out = run_relationships_refresh(
+                                    session,
+                                    api_key=key,
+                                    company_symbols=[ticker_input],
+                                    rate_limit_per_minute=settings.rate_limit_per_minute,
+                                )
+                            except Exception as exc:
+                                msg = scrub_token(str(exc), key)
+                                st.error(f"Refresh failed: {msg}")
+                            else:
+                                r = refresh_out["companies"][0] if refresh_out["companies"] else None
+                                if r is not None:
+                                    parts = []
+                                    if r.peers_added:
+                                        parts.append(f"{r.peers_added} peers")
+                                    if r.suppliers_added:
+                                        parts.append(f"{r.suppliers_added} suppliers")
+                                    if r.customers_added:
+                                        parts.append(f"{r.customers_added} customers")
+                                    if parts:
+                                        st.success("Refreshed: " + ", ".join(parts))
+                                    if r.failures:
+                                        with st.expander(
+                                            f"⚠ {len(r.failures)} call(s) failed",
+                                            expanded=False,
+                                        ):
+                                            for f in r.failures:
+                                                st.write(
+                                                    f"**`{f['op']}`** — {f['error']}"
+                                                )
+
+                if ticker_input:
+                    bundle = compose_company_focus(
+                        session, ticker_input, model_version=vader_version
+                    )
+                    _render_company_focus(session, bundle)
+                else:
+                    st.info("Type a ticker to focus on.")
+
+            elif mode == "Sector":
+                sectors = all_sectors(session)
+                if not sectors:
+                    st.info("Sectors not seeded yet — run an ingestion cycle first.")
+                else:
+                    sector_labels = {f"{s.name} ({s.etf_symbol})": s for s in sectors}
+                    chosen_label = st.selectbox(
+                        "Sector", options=list(sector_labels.keys())
+                    )
+                    chosen = sector_labels[chosen_label]
+                    refresh_clicked = st.button(
+                        "Refresh constituents",
+                        help=(
+                            "Calls Finnhub's /etf/holdings to update the "
+                            "cached top constituents. Requires a key."
+                        ),
+                    )
+                    if refresh_clicked:
+                        key = (st.session_state.get(API_KEY_SESSION_KEY) or "").strip()
+                        if not key:
+                            st.warning("Set the API key in the sidebar first.")
+                        else:
+                            with st.spinner(f"Refreshing {chosen.etf_symbol} constituents…"):
+                                try:
+                                    out = run_relationships_refresh(
+                                        session,
+                                        api_key=key,
+                                        sector_etfs=[chosen.etf_symbol],
+                                    )
+                                except Exception as exc:
+                                    msg = scrub_token(str(exc), key)
+                                    st.error(f"Refresh failed: {msg}")
+                                else:
+                                    sr = out["sectors"][0] if out["sectors"] else None
+                                    if sr is not None:
+                                        st.success(
+                                            f"Refreshed: {sr.holdings_added} constituents"
+                                        )
+                                        if sr.failures:
+                                            with st.expander(
+                                                "⚠ failures", expanded=False,
+                                            ):
+                                                for f in sr.failures:
+                                                    st.write(
+                                                        f"**`{f['op']}`** — {f['error']}"
+                                                    )
+
+                    bundle = compose_sector_focus(
+                        session, chosen.code, model_version=vader_version,
+                    )
+                    if bundle is None:
+                        st.info("Sector not found in DB.")
+                    else:
+                        _render_sector_focus(session, bundle)
+
+            else:  # Event
+                col1, col2 = st.columns([3, 1])
+                query = col1.text_input(
+                    "Search news for:",
+                    placeholder="e.g. Iran war, Fed rate cut, layoffs",
+                )
+                lookback = col2.slider(
+                    "Lookback days",
+                    min_value=1, max_value=90, value=14, step=1,
+                    key="event_lookback",
+                )
+                if query:
+                    bundle = compose_event_focus(
+                        session, query,
+                        lookback_days=lookback,
+                        model_version=vader_version,
+                    )
+                    _render_event_focus(session, bundle)
+                else:
+                    st.info("Type a query to search.")
+
+
+def _render_related_grid(
+    session: Session,
+    rows: list[RelatedPrediction],
+    *,
+    relationship_label: str,
+) -> None:  # pragma: no cover - rendering glue
+    """Compact table of related entities + their predictions."""
+    if not rows:
+        return
+    df_rows = []
+    for r in rows:
+        df_rows.append(
+            {
+                relationship_label: r.related_symbol,
+                "Company": expand_symbol_short(session, r.related_symbol),
+                "Call": r.prediction.label if r.prediction else "—",
+                "Confidence": r.prediction.confidence if r.prediction else None,
+                "Articles": r.prediction.article_count if r.prediction else 0,
+                "Sentiment": r.prediction.sentiment_index if r.prediction else None,
+                "Note": r.metadata_text or "",
+            }
+        )
+    df = pd.DataFrame(df_rows)
+    st.dataframe(
+        df, use_container_width=True, hide_index=True,
+        column_config={
+            "Confidence": st.column_config.ProgressColumn(
+                "Confidence", min_value=0.0, max_value=1.0, format="%.2f",
+            ),
+            "Sentiment": st.column_config.NumberColumn(
+                "Sentiment", format="%+.3f",
+            ),
+        },
+    )
+
+
+def _render_company_focus(
+    session: Session, bundle: CompanyFocus
+) -> None:  # pragma: no cover - rendering glue
+    long_name = expand_symbol(session, bundle.symbol)
+    st.subheader(long_name)
+
+    cols = st.columns(3)
+    if bundle.own_prediction is not None:
+        cols[0].metric("Call", bundle.own_prediction.label)
+        cols[1].metric("Confidence", f"{bundle.own_prediction.confidence:.2f}")
+        cols[2].metric("Articles", bundle.own_prediction.article_count)
+    else:
+        cols[0].metric("Call", "—")
+        cols[1].metric("Confidence", "—")
+        cols[2].metric("Articles", 0)
+
+    if bundle.sector_etf:
+        st.caption(
+            f"Sector: **{bundle.sector_code or '?'}** "
+            f"(`{bundle.sector_etf}`)" + (
+                f" — sector call **{bundle.sector_prediction.label}** "
+                f"(conf {bundle.sector_prediction.confidence:.2f})"
+                if bundle.sector_prediction else " — no sector call yet"
+            )
+        )
+
+    if bundle.peers:
+        st.markdown("**Peers**")
+        _render_related_grid(session, bundle.peers, relationship_label="Peer")
+    if bundle.suppliers:
+        st.markdown("**Suppliers**")
+        _render_related_grid(session, bundle.suppliers, relationship_label="Supplier")
+    if bundle.customers:
+        st.markdown("**Customers**")
+        _render_related_grid(session, bundle.customers, relationship_label="Customer")
+
+    if not (bundle.peers or bundle.suppliers or bundle.customers):
+        st.caption(
+            "No cached relationships yet. Click *Refresh peers + supply "
+            "chain* above to pull them from Finnhub."
+        )
+
+    st.markdown("**Recent articles (subject + peers)**")
+    if bundle.recent_articles:
+        for row in bundle.recent_articles:
+            sym = (row.get("symbol") or "").strip()
+            if sym and sym != "*":
+                row["company"] = expand_symbol_short(session, sym)
+        attach_first_seen(session, bundle.recent_articles)
+        for row in bundle.recent_articles:
+            st.markdown("- " + _format_headline_markdown(row))
+    else:
+        st.write("No matching articles in the last 30 days.")
+
+
+def _render_sector_focus(
+    session: Session, bundle: SectorFocus
+) -> None:  # pragma: no cover - rendering glue
+    st.subheader(f"{bundle.sector_name} ({bundle.etf_symbol})")
+    cols = st.columns(3)
+    if bundle.own_prediction is not None:
+        cols[0].metric("Call", bundle.own_prediction.label)
+        cols[1].metric("Confidence", f"{bundle.own_prediction.confidence:.2f}")
+        cols[2].metric("Articles", bundle.own_prediction.article_count)
+    else:
+        cols[0].metric("Call", "—")
+        cols[1].metric("Confidence", "—")
+        cols[2].metric("Articles", 0)
+
+    if bundle.constituents:
+        st.markdown("**Top constituents**")
+        _render_related_grid(
+            session, bundle.constituents, relationship_label="Ticker"
+        )
+    else:
+        st.caption(
+            "No constituents cached yet. Click *Refresh constituents* to pull "
+            "the top holdings from Finnhub's /etf/holdings."
+        )
+
+    st.markdown("**Recent articles (ETF + constituents)**")
+    if bundle.recent_articles:
+        for row in bundle.recent_articles:
+            sym = (row.get("symbol") or "").strip()
+            if sym and sym != "*":
+                row["company"] = expand_symbol_short(session, sym)
+        attach_first_seen(session, bundle.recent_articles)
+        for row in bundle.recent_articles:
+            st.markdown("- " + _format_headline_markdown(row))
+    else:
+        st.write("No matching articles in the last 30 days.")
+
+
+def _render_event_focus(
+    session: Session, bundle: EventFocus
+) -> None:  # pragma: no cover - rendering glue
+    cols = st.columns(4)
+    cols[0].metric("Implied Call", bundle.implied_label)
+    cols[1].metric("Confidence", f"{bundle.implied_confidence:.2f}")
+    cols[2].metric("Articles", bundle.article_count)
+    cols[3].metric(
+        "Aggregate sentiment",
+        f"{bundle.aggregate_sentiment:+.3f}" if bundle.article_count else "—",
+    )
+    st.caption(
+        f"Searched the news DB for `{bundle.query}` over the last "
+        f"{bundle.lookback_days} day(s). Implied Call uses sign-of-mean "
+        "(±0.1 dead-band); confidence is |mean|/0.5 clipped to 1."
+    )
+
+    if bundle.target_breakdown:
+        st.markdown("**Per-ticker breakdown**")
+        rows = []
+        for b in bundle.target_breakdown:
+            sym = b["symbol"]
+            rows.append(
+                {
+                    "Ticker": sym,
+                    "Company": expand_symbol_short(session, sym) if sym != "*" else "(general)",
+                    "Articles": b["articles"],
+                    "Scored": b["scored"],
+                    "Mean sentiment": (
+                        b["mean_sentiment"]
+                        if b["mean_sentiment"] == b["mean_sentiment"]
+                        else None
+                    ),
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(rows), use_container_width=True, hide_index=True,
+            column_config={
+                "Mean sentiment": st.column_config.NumberColumn(
+                    "Mean sentiment", format="%+.3f",
+                ),
+            },
+        )
+
+    st.markdown("**Matching articles**")
+    if bundle.matched_articles:
+        for row in bundle.matched_articles:
+            sym = (row.get("symbol") or "").strip()
+            if sym and sym != "*":
+                row["company"] = expand_symbol_short(session, sym)
+        attach_first_seen(session, bundle.matched_articles)
+        for row in bundle.matched_articles:
+            st.markdown("- " + _format_headline_markdown(row))
+    else:
+        st.write("No matches.")
 
 
 if __name__ == "__main__":  # pragma: no cover

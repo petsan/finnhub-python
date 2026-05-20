@@ -174,3 +174,21 @@ class FinnhubGateway:
         self, symbol: str, resolution: str, _from: int, to: int
     ) -> dict[str, Any]:
         return self._call(self.client.stock_candles, symbol, resolution, _from, to)
+
+    # --- Relationships -----------------------------------------------------
+
+    def company_peers(self, symbol: str) -> list[str]:
+        """Tickers Finnhub considers peers of ``symbol``."""
+        return self._call(self.client.company_peers, symbol)
+
+    def company_profile2(self, symbol: str) -> dict[str, Any]:
+        """Free-tier company profile (finnhubIndustry, name, exchange, …)."""
+        return self._call(self.client.company_profile2, symbol=symbol)
+
+    def stock_supply_chain(self, symbol: str) -> dict[str, Any]:
+        """Suppliers + customers graph. Often gated on free tier (403)."""
+        return self._call(self.client.stock_supply_chain, symbol)
+
+    def etfs_holdings(self, symbol: str) -> dict[str, Any]:
+        """Top holdings of an ETF (used for sector ETFs)."""
+        return self._call(self.client.etfs_holdings, symbol=symbol)

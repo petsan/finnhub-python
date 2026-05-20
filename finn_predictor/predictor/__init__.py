@@ -16,6 +16,18 @@ from finn_predictor.predictor.explain import (
     article_contributions,
     explain_prediction,
 )
+from finn_predictor.predictor.focus import (
+    CompanyFocus,
+    EventFocus,
+    RefreshResult,
+    RelatedPrediction,
+    SectorFocus,
+    compose_company_focus,
+    compose_event_focus,
+    compose_sector_focus,
+    refresh_company_relationships,
+    refresh_sector_constituents,
+)
 from finn_predictor.predictor.market import classify, predict_market
 from finn_predictor.predictor.sectors import predict_all_sectors, predict_sector
 from finn_predictor.predictor.stocks import (
@@ -38,11 +50,21 @@ from finn_predictor.predictor.trades import (
 
 __all__ = [
     "ArticleContribution",
+    "CompanyFocus",
+    "EventFocus",
     "PerformanceSummary",
+    "RefreshResult",
+    "RelatedPrediction",
+    "SectorFocus",
     "SentimentSummary",
     "TradeRecord",
     "aggregate_sentiment",
     "article_contributions",
+    "compose_company_focus",
+    "compose_event_focus",
+    "compose_sector_focus",
+    "refresh_company_relationships",
+    "refresh_sector_constituents",
     "classify",
     "cumulative_pnl_series",
     "daily_sentiment_index",

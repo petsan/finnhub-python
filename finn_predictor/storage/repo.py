@@ -14,6 +14,7 @@ from finn_predictor.storage.models import (
     PriceBar,
     Prediction,
     PredictionOutcome,
+    RelatedEntity,
     Sector,
     SentimentScore,
 )
@@ -309,6 +310,86 @@ def ensure_default_sectors(session: Session) -> list[Sector]:
 
 def all_sectors(session: Session) -> Sequence[Sector]:
     return list(session.scalars(select(Sector).order_by(Sector.code)))
+
+
+# -- Related entities ------------------------------------------------------
+
+# The fixed vocabulary for RelatedEntity.relationship. Anything else
+# is a programming error.
+RELATIONSHIPS = frozenset(
+    {"PEER", "SUPPLIER", "CUSTOMER", "ETF_HOLDING"}
+)
+
+
+def upsert_related_entity(
+    session: Session,
+    *,
+    source_symbol: str,
+    related_symbol: str,
+    relationship: str,
+    rank: Optional[int] = None,
+    metadata_text: Optional[str] = None,
+    fetched_at: Optional[datetime] = None,
+) -> RelatedEntity:
+    """Idempotently insert or refresh a (source, related, relationship) row.
+
+    On conflict the ``rank``, ``metadata_text``, and ``fetched_at`` columns
+    are updated; the older fields are overwritten with whatever the caller
+    just observed. Returns the persisted instance.
+    """
+    if relationship not in RELATIONSHIPS:
+        raise ValueError(
+            f"relationship must be one of {sorted(RELATIONSHIPS)}, got {relationship!r}"
+        )
+    fetched = fetched_at or _utcnow()
+
+    existing = session.scalar(
+        select(RelatedEntity).where(
+            RelatedEntity.source_symbol == source_symbol,
+            RelatedEntity.related_symbol == related_symbol,
+            RelatedEntity.relationship == relationship,
+        )
+    )
+    if existing is not None:
+        existing.rank = rank
+        existing.metadata_text = metadata_text
+        existing.fetched_at = fetched
+        session.commit()
+        return existing
+
+    row = RelatedEntity(
+        source_symbol=source_symbol,
+        related_symbol=related_symbol,
+        relationship=relationship,
+        rank=rank,
+        metadata_text=metadata_text,
+        fetched_at=fetched,
+    )
+    session.add(row)
+    session.commit()
+    return row
+
+
+def related_entities_for(
+    session: Session,
+    source_symbol: str,
+    *,
+    relationship: Optional[str] = None,
+) -> list[RelatedEntity]:
+    """Cached related entities for ``source_symbol``.
+
+    Order: by ``rank`` ascending (None last), then by ``related_symbol``.
+    """
+    stmt = select(RelatedEntity).where(
+        RelatedEntity.source_symbol == source_symbol
+    )
+    if relationship is not None:
+        stmt = stmt.where(RelatedEntity.relationship == relationship)
+    rows = list(session.scalars(stmt))
+    rows.sort(
+        key=lambda r: (r.rank is None, r.rank if r.rank is not None else 0, r.related_symbol)
+    )
+    return rows
 
 
 # -- Date helpers used widely ----------------------------------------------
