@@ -18,7 +18,12 @@ from finn_predictor.predictor.explain import (
 )
 from finn_predictor.predictor.market import classify, predict_market
 from finn_predictor.predictor.sectors import predict_all_sectors, predict_sector
-from finn_predictor.predictor.stocks import predict_all_stocks, predict_stock
+from finn_predictor.predictor.stocks import (
+    predict_all_stocks,
+    predict_stock,
+    retroactive_predict_many,
+    retroactive_predict_stock,
+)
 
 __all__ = [
     "ArticleContribution",
@@ -33,5 +38,7 @@ __all__ = [
     "predict_market",
     "predict_sector",
     "predict_stock",
+    "retroactive_predict_many",
+    "retroactive_predict_stock",
     "rolling_baseline",
 ]

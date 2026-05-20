@@ -1,5 +1,10 @@
 """Ingestion: thin retry/throttling wrapper + news/price fetchers + jobs."""
 
+from finn_predictor.ingestion.backfill import (
+    BackfillResult,
+    backfill_company_news,
+    backfill_many,
+)
 from finn_predictor.ingestion.client import (
     FinnhubGateway,
     IngestionError,
@@ -11,10 +16,13 @@ from finn_predictor.ingestion.news import ingest_company_news, ingest_general_ne
 from finn_predictor.ingestion.prices import ingest_price_history
 
 __all__ = [
+    "BackfillResult",
     "FinnhubGateway",
     "IngestionError",
     "RateLimiter",
     "REDACTED",
+    "backfill_company_news",
+    "backfill_many",
     "ingest_company_news",
     "ingest_general_news",
     "ingest_price_history",

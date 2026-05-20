@@ -29,6 +29,7 @@ from finn_predictor.ui.app import (
     partition_predictions,
     prediction_history,
     recent_headlines,
+    run_backfill_with_key,
     run_ingestion_with_key,
     sector_grid,
     stock_predictions_table,
@@ -809,6 +810,108 @@ def test_run_ingestion_with_key_scrubs_leaked_token_from_message(session) -> Non
         assert REDACTED in msg
         # Context chain suppressed -> default tracebacks won't re-leak via __cause__.
         assert excinfo.value.__suppress_context__ is True
+
+
+def test_run_backfill_with_key_rejects_empty_inputs(session) -> None:
+    with pytest.raises(ValueError):
+        run_backfill_with_key(
+            session, api_key="", symbols=["AAPL"],
+            start=D - timedelta(days=5), end=D,
+        )
+    with pytest.raises(ValueError):
+        run_backfill_with_key(
+            session, api_key="sk-x", symbols=[],
+            start=D - timedelta(days=5), end=D,
+        )
+    with pytest.raises(ValueError):
+        run_backfill_with_key(
+            session, api_key="sk-x", symbols=["", "  "],
+            start=D - timedelta(days=5), end=D,
+        )
+
+
+def test_run_backfill_with_key_routes_through_client(session) -> None:
+    """Helper builds a client with the in-session key and runs backfill_many."""
+    from finn_predictor.ingestion.backfill import BackfillResult
+
+    fake_results = {
+        "AAPL": BackfillResult(
+            symbol="AAPL", inserted=12, chunks_attempted=2,
+            chunks_failed=0, failures=[],
+        )
+    }
+
+    with patch("finn_predictor.ui.app.FinnhubClient") as mock_cls, \
+         patch("finn_predictor.ui.app.backfill_many", return_value=fake_results) as bm, \
+         patch(
+             "finn_predictor.ui.app.score_pending_articles", return_value=7
+         ) as sp, \
+         patch(
+             "finn_predictor.ui.app.retroactive_predict_many",
+             return_value={"AAPL": 30},
+         ) as rp:
+        mock_cls.return_value.close = lambda: None
+        out = run_backfill_with_key(
+            session,
+            api_key="sk-session-only",
+            symbols=["AAPL"],
+            start=D - timedelta(days=30),
+            end=D,
+        )
+
+    mock_cls.assert_called_once_with(api_key="sk-session-only")
+    assert out["backfill"] == fake_results
+    assert out["scored"] == 7
+    assert out["predictions"] == {"AAPL": 30}
+    bm.assert_called_once()
+    sp.assert_called_once()
+    rp.assert_called_once()
+
+
+def test_run_backfill_with_key_disables_env_proxy(session) -> None:
+    """Same proxy bypass as run_ingestion_with_key."""
+    from finn_predictor.ingestion.backfill import BackfillResult
+
+    fake_results = {
+        "AAPL": BackfillResult(
+            symbol="AAPL", inserted=0, chunks_attempted=1,
+            chunks_failed=0, failures=[],
+        )
+    }
+    with patch("finn_predictor.ui.app.FinnhubClient") as mock_cls, \
+         patch("finn_predictor.ui.app.backfill_many", return_value=fake_results), \
+         patch("finn_predictor.ui.app.score_pending_articles", return_value=0), \
+         patch(
+             "finn_predictor.ui.app.retroactive_predict_many", return_value={"AAPL": 0}
+         ):
+        client_instance = mock_cls.return_value
+        client_instance._session.trust_env = True
+        client_instance.close = lambda: None
+        run_backfill_with_key(
+            session, api_key="sk-x", symbols=["AAPL"],
+            start=D - timedelta(days=1), end=D,
+        )
+        assert client_instance._session.trust_env is False
+
+
+def test_run_backfill_with_key_scrubs_leaked_token(session) -> None:
+    """An unexpected leak in a non-IngestionError must still be scrubbed."""
+    from finn_predictor.ingestion.client import IngestionError, REDACTED
+
+    with patch("finn_predictor.ui.app.FinnhubClient") as mock_cls, \
+         patch(
+             "finn_predictor.ui.app.backfill_many",
+             side_effect=RuntimeError("token=sk-leak-x in url"),
+         ):
+        mock_cls.return_value.close = lambda: None
+        with pytest.raises(IngestionError) as excinfo:
+            run_backfill_with_key(
+                session, api_key="sk-leak-x", symbols=["AAPL"],
+                start=D - timedelta(days=5), end=D,
+            )
+        msg = str(excinfo.value)
+        assert "sk-leak-x" not in msg
+        assert REDACTED in msg
 
 
 def test_api_key_is_never_persisted_to_db(session) -> None:

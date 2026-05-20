@@ -13,6 +13,7 @@ to disk or to the database.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
@@ -24,18 +25,20 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from finn_predictor.config import load_settings
+from finn_predictor.ingestion.backfill import BackfillResult, backfill_many
 from finn_predictor.ingestion.client import (
     FinnhubGateway,
     IngestionError,
     RateLimiter,
     scrub_token,
 )
-from finn_predictor.ingestion.jobs import run_daily_ingest
+from finn_predictor.ingestion.jobs import run_daily_ingest, score_pending_articles
 from finn_predictor.predictor.explain import (
     ArticleContribution,
     article_contributions,
     explain_prediction,
 )
+from finn_predictor.predictor.stocks import retroactive_predict_many
 from finn_predictor.sentiment.vader import VaderScorer
 from finn_predictor.storage import create_engine_and_session, init_db
 from finn_predictor.storage.models import (
@@ -553,16 +556,94 @@ def run_ingestion_with_key(
     return counts
 
 
+def run_backfill_with_key(
+    session: Session,
+    *,
+    api_key: str,
+    symbols: Iterable[str],
+    start: datetime,
+    end: datetime,
+    chunk_days: int = 30,
+    rate_limit_per_minute: int = 55,
+) -> dict[str, object]:
+    """Backfill historical company news for each ticker, score, retro-predict.
+
+    Mirrors :func:`run_ingestion_with_key`'s safety guarantees: the key
+    lives only inside the locally-scoped client, ``trust_env=False`` to
+    bypass dev proxies, and any leak in exception messages is scrubbed
+    via :class:`IngestionError`.
+
+    Returns a dict with:
+      * ``backfill``: ``{symbol: BackfillResult}`` from
+        :func:`backfill_many`.
+      * ``scored``: how many new sentiment rows were written.
+      * ``predictions``: ``{symbol: n}`` from :func:`retroactive_predict_many`.
+    """
+    if not api_key or not api_key.strip():
+        raise ValueError("api_key must be a non-empty string")
+    syms = [s.strip() for s in symbols if s and s.strip()]
+    if not syms:
+        raise ValueError("symbols must contain at least one non-empty ticker")
+
+    client = FinnhubClient(api_key=api_key)
+    try:
+        client._session.trust_env = False
+    except AttributeError:  # pragma: no cover
+        pass
+
+    try:
+        gateway = FinnhubGateway(
+            client=client,
+            rate_limiter=RateLimiter(rate_limit_per_minute),
+        )
+        scorer = VaderScorer()
+        try:
+            results = backfill_many(
+                session,
+                gateway,
+                symbols=syms,
+                start=start,
+                end=end,
+                chunk_days=chunk_days,
+            )
+            scored = score_pending_articles(session, scorer)
+            predictions = retroactive_predict_many(
+                session,
+                scorer=scorer,
+                symbols=syms,
+                start=start,
+                end=end,
+            )
+        except IngestionError:
+            raise
+        except Exception as exc:
+            raise IngestionError(scrub_token(str(exc), api_key)) from None
+    finally:
+        client.close()
+
+    return {
+        "backfill": results,
+        "scored": scored,
+        "predictions": predictions,
+    }
+
+
 # -- Streamlit page (thin glue, exercised only via the dev server) --------
 
 
-def _render_sidebar() -> tuple[str | None, str]:  # pragma: no cover - Streamlit UI
-    """Render the API-key sidebar.
+@dataclass(frozen=True)
+class _SidebarState:
+    """What the sidebar surfaced to ``main()`` on this rerun."""
 
-    Returns ``(triggered_key, symbols_csv)`` — ``triggered_key`` is the
-    current in-session key iff the user clicked "Run ingestion now" this
-    render, otherwise ``None``.
-    """
+    triggered_key: str | None
+    symbols_csv: str
+    backfill_triggered_key: str | None
+    backfill_tickers_csv: str
+    backfill_lookback_days: int
+
+
+def _render_sidebar() -> _SidebarState:  # pragma: no cover - Streamlit UI
+    """Render the API-key + ingestion + backfill sidebar."""
     with st.sidebar:
         st.header("Finnhub API key")
         st.caption(
@@ -599,8 +680,44 @@ def _render_sidebar() -> tuple[str | None, str]:  # pragma: no cover - Streamlit
         with col_run:
             run_clicked = st.button("Run ingestion now", disabled=not current)
 
+        st.divider()
+        st.subheader("Backfill historical news")
+        st.caption(
+            "Pulls `/company-news` for each ticker over the lookback "
+            "window, dedupes against the existing DB, scores new "
+            "articles, and writes one Prediction per UTC day so the "
+            "*History* tab and rolling baseline populate immediately. "
+            "Free-tier Finnhub keys typically allow ~1 year back."
+        )
+        backfill_tickers_csv = st.text_input(
+            "Tickers to backfill (CSV)",
+            value="",
+            placeholder="AAPL, MSFT, NVDA",
+            key="backfill_tickers_input",
+        )
+        backfill_lookback_days = st.slider(
+            "Lookback (days)",
+            min_value=7,
+            max_value=365,
+            value=30,
+            step=1,
+            help="Window: today minus N days through today (UTC).",
+        )
+        backfill_clicked = st.button(
+            "Backfill",
+            disabled=not (current and backfill_tickers_csv.strip()),
+            help="Requires a key + at least one ticker.",
+        )
+
     triggered = current if (current and run_clicked) else None
-    return triggered, symbols_csv
+    backfill_key = current if (current and backfill_clicked) else None
+    return _SidebarState(
+        triggered_key=triggered,
+        symbols_csv=symbols_csv,
+        backfill_triggered_key=backfill_key,
+        backfill_tickers_csv=backfill_tickers_csv,
+        backfill_lookback_days=backfill_lookback_days,
+    )
 
 
 def _parse_symbols(csv: str) -> list[str]:
@@ -618,9 +735,64 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
     engine, SessionLocal = create_engine_and_session(settings.database_url)
     init_db(engine)
 
-    triggered_key, symbols_csv = _render_sidebar()
+    sidebar = _render_sidebar()
+    triggered_key = sidebar.triggered_key
+    symbols_csv = sidebar.symbols_csv
 
     with SessionLocal() as session:
+        if sidebar.backfill_triggered_key:
+            backfill_syms = _parse_symbols(sidebar.backfill_tickers_csv)
+            today_utc = datetime.now(timezone.utc)
+            start = today_utc - timedelta(days=sidebar.backfill_lookback_days)
+            label = (
+                f"Backfilling {len(backfill_syms)} ticker(s) over "
+                f"{sidebar.backfill_lookback_days} days…"
+            )
+            with st.spinner(label):
+                try:
+                    backfill_out = run_backfill_with_key(
+                        session,
+                        api_key=sidebar.backfill_triggered_key,
+                        symbols=backfill_syms,
+                        start=start,
+                        end=today_utc,
+                        rate_limit_per_minute=settings.rate_limit_per_minute,
+                    )
+                except Exception as exc:
+                    msg = scrub_token(str(exc), sidebar.backfill_triggered_key)
+                    st.sidebar.error(f"Backfill failed: {msg}")
+                else:
+                    total_inserted = sum(
+                        r.inserted for r in backfill_out["backfill"].values()
+                    )
+                    total_failures = sum(
+                        r.chunks_failed for r in backfill_out["backfill"].values()
+                    )
+                    total_preds = sum(backfill_out["predictions"].values())
+                    st.sidebar.success(
+                        f"Backfill done — articles +{total_inserted}, "
+                        f"scored {backfill_out['scored']}, "
+                        f"predictions {total_preds}"
+                    )
+                    with st.sidebar.expander(
+                        "Backfill detail",
+                        expanded=False,
+                    ):
+                        for sym, res in backfill_out["backfill"].items():
+                            n_pred = backfill_out["predictions"].get(sym, 0)
+                            st.write(
+                                f"**`{sym}`** — +{res.inserted} articles, "
+                                f"{res.succeeded_chunks}/{res.chunks_attempted} "
+                                f"chunk(s) ok, {n_pred} prediction(s)"
+                            )
+                            for f in res.failures:
+                                st.caption(f"  · {f['error']}")
+                    if total_failures:
+                        st.sidebar.caption(
+                            f"⚠ {total_failures} chunk(s) failed across "
+                            "tickers; see Backfill detail."
+                        )
+
         if triggered_key:
             symbols = _parse_symbols(symbols_csv)
             with st.spinner("Ingesting news & prices…"):

@@ -14,7 +14,7 @@ rather than by reaching into ``market`` for a non-market call.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 from sqlalchemy.orm import Session
@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from finn_predictor.predictor.market import predict_market
 from finn_predictor.sentiment.base import Scorer
 from finn_predictor.storage.models import Prediction
+from finn_predictor.storage.repo import utc_day_window
 
 
 def predict_stock(
@@ -67,4 +68,64 @@ def predict_all_stocks(
         pred = predict_stock(session, scorer=scorer, symbol=sym, on_date=on_date)
         if pred is not None:
             out.append(pred)
+    return out
+
+
+def retroactive_predict_stock(
+    session: Session,
+    *,
+    scorer: Scorer,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+) -> int:
+    """Generate one :class:`Prediction` per UTC day in ``[start, end]``.
+
+    Used after a historical backfill to populate the *History* tab and
+    establish a real rolling baseline. Days with no scored articles in
+    the window are skipped (predict_stock returns None). Re-running is
+    safe — the start-of-UTC-day prediction_date normalization plus
+    save_prediction's upsert collapse same-day re-runs.
+
+    ``start`` and ``end`` are normalised to UTC if naive.
+    """
+    if not symbol or not symbol.strip():
+        raise ValueError("symbol must be a non-empty string")
+
+    start_utc = start if start.tzinfo else start.replace(tzinfo=timezone.utc)
+    end_utc = end if end.tzinfo else end.replace(tzinfo=timezone.utc)
+    if end_utc < start_utc:
+        return 0
+
+    day, _ = utc_day_window(start_utc)
+    last_day, _ = utc_day_window(end_utc)
+    written = 0
+    while day <= last_day:
+        pred = predict_stock(session, scorer=scorer, symbol=symbol, on_date=day)
+        if pred is not None:
+            written += 1
+        day = day + timedelta(days=1)
+    return written
+
+
+def retroactive_predict_many(
+    session: Session,
+    *,
+    scorer: Scorer,
+    symbols: Iterable[str],
+    start: datetime,
+    end: datetime,
+) -> dict[str, int]:
+    """Run :func:`retroactive_predict_stock` for each ticker.
+
+    Returns ``{symbol: predictions_written}``.
+    """
+    out: dict[str, int] = {}
+    for sym in symbols:
+        sym = sym.strip()
+        if not sym:
+            continue
+        out[sym] = retroactive_predict_stock(
+            session, scorer=scorer, symbol=sym, start=start, end=end
+        )
     return out

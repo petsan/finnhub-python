@@ -6,7 +6,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from finn_predictor.predictor.stocks import predict_all_stocks, predict_stock
+from finn_predictor.predictor.stocks import (
+    predict_all_stocks,
+    predict_stock,
+    retroactive_predict_many,
+    retroactive_predict_stock,
+)
 from finn_predictor.storage.repo import (
     predictions_for,
     save_scores,
@@ -135,3 +140,116 @@ def test_predict_all_stocks_skips_empty_string(session) -> None:
         session, scorer=_FixedScorer(), symbols=["AAPL", ""], on_date=D
     )
     assert [p.target_symbol for p in out] == ["AAPL"]
+
+
+# ---------------- retroactive_predict_stock ----------------
+
+
+def test_retroactive_predict_stock_one_per_day_with_articles(session) -> None:
+    """Seed articles on day 1, day 3, day 5. Retro-predict over a 5-day
+    range → 3 predictions, one per day-with-data."""
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    _seed_company(session, symbol="AAPL", scores=[0.9, 0.8, 0.85], day=base)
+    _seed_company(
+        session, symbol="AAPL", scores=[0.7, 0.8, 0.6],
+        day=base + timedelta(days=2),
+    )
+    _seed_company(
+        session, symbol="AAPL", scores=[-0.7, -0.8, -0.9],
+        day=base + timedelta(days=4),
+    )
+
+    n = retroactive_predict_stock(
+        session,
+        scorer=_FixedScorer(),
+        symbol="AAPL",
+        start=base,
+        end=base + timedelta(days=4),
+    )
+    assert n == 3
+
+    rows = predictions_for(session, "AAPL")
+    assert len(rows) == 3
+    # Predictions are at start-of-UTC-day (normalised).
+    days = sorted(
+        (r.prediction_date.replace(tzinfo=None) if r.prediction_date.tzinfo else r.prediction_date)
+        for r in rows
+    )
+    assert days == [
+        datetime(2026, 5, 1),
+        datetime(2026, 5, 3),
+        datetime(2026, 5, 5),
+    ]
+
+
+def test_retroactive_predict_stock_idempotent(session) -> None:
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    _seed_company(session, symbol="AAPL", scores=[0.9, 0.8, 0.85], day=base)
+    a = retroactive_predict_stock(
+        session, scorer=_FixedScorer(), symbol="AAPL",
+        start=base, end=base,
+    )
+    b = retroactive_predict_stock(
+        session, scorer=_FixedScorer(), symbol="AAPL",
+        start=base, end=base,
+    )
+    assert a == 1 and b == 1
+    assert len(predictions_for(session, "AAPL")) == 1
+
+
+def test_retroactive_predict_stock_empty_range(session) -> None:
+    """end < start → 0 predictions, no error."""
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    n = retroactive_predict_stock(
+        session, scorer=_FixedScorer(), symbol="AAPL",
+        start=base, end=base - timedelta(days=1),
+    )
+    assert n == 0
+
+
+def test_retroactive_predict_stock_rejects_empty_symbol(session) -> None:
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    with pytest.raises(ValueError):
+        retroactive_predict_stock(
+            session, scorer=_FixedScorer(), symbol="",
+            start=base, end=base,
+        )
+
+
+def test_retroactive_predict_stock_handles_naive_datetimes(session) -> None:
+    naive = datetime(2026, 5, 1)
+    _seed_company(
+        session, symbol="AAPL", scores=[0.9, 0.8, 0.85],
+        day=naive.replace(tzinfo=timezone.utc),
+    )
+    n = retroactive_predict_stock(
+        session, scorer=_FixedScorer(), symbol="AAPL",
+        start=naive, end=naive,
+    )
+    assert n == 1
+
+
+def test_retroactive_predict_many(session) -> None:
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    _seed_company(session, symbol="AAPL", scores=[0.9, 0.8, 0.85], day=base)
+    _seed_company(session, symbol="MSFT", scores=[-0.7, -0.6, -0.8], day=base)
+
+    out = retroactive_predict_many(
+        session,
+        scorer=_FixedScorer(),
+        symbols=["AAPL", "MSFT", "NVDA"],  # NVDA has no articles
+        start=base,
+        end=base,
+    )
+    assert out == {"AAPL": 1, "MSFT": 1, "NVDA": 0}
+
+
+def test_retroactive_predict_many_skips_blank_entries(session) -> None:
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    _seed_company(session, symbol="AAPL", scores=[0.9, 0.8, 0.85], day=base)
+    out = retroactive_predict_many(
+        session, scorer=_FixedScorer(),
+        symbols=["AAPL", "", "  "],
+        start=base, end=base,
+    )
+    assert list(out.keys()) == ["AAPL"]
