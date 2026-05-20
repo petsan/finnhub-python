@@ -20,6 +20,8 @@ from finn_predictor.ui.app import (
     BROWSER_STORAGE_API_KEY,
     NEUTRAL_SENTIMENT_THRESHOLD,
     _get_local_storage,
+    build_market_price_chart,
+    group_stock_predictions_by_sector,
     _escape_markdown,
     _format_headline_markdown,
     _parse_symbols,
@@ -44,7 +46,7 @@ from finn_predictor.ui.app import (
     sector_grid,
     stock_predictions_table,
 )
-from tests.conftest import make_article, make_prediction, make_score
+from tests.conftest import make_article, make_prediction, make_price_bar, make_score
 
 
 D = datetime(2026, 5, 19, 12, tzinfo=timezone.utc)
@@ -1195,6 +1197,89 @@ def test_get_local_storage_ignores_falsey_disable_values(monkeypatch) -> None:
     # will time out — but plain `python` raises immediately, so:
     result = _get_local_storage()  # noqa: F841 — exercising the path is the test
     # No raise == pass; we don't constrain the return type beyond that.
+
+
+def test_build_market_price_chart_returns_none_on_empty_bars() -> None:
+    """No bars → None so the caller hides the chart entirely."""
+    assert build_market_price_chart([]) is None
+
+
+def test_build_market_price_chart_returns_chart_with_data() -> None:
+    """Bars in, Altair Chart out — pannable + zoomable via interactive()."""
+    import altair as alt
+    bars = [
+        make_price_bar(symbol="^GSPC", trade_date=D - timedelta(days=i), close=4000.0 + i)
+        for i in range(20)
+    ]
+    chart = build_market_price_chart(bars, symbol="^GSPC", days=30)
+    assert chart is not None
+    # Spec inspection rather than rendering: confirm the y-axis is bound
+    # to the close column and that the chart is interactive (zoom+pan).
+    spec = chart.to_dict()
+    assert spec["encoding"]["y"]["field"] == "close"
+    assert spec["encoding"]["x"]["field"] == "date"
+    # interactive() injects a default selection parameter.
+    assert "params" in spec or "selection" in spec
+
+
+def test_build_market_price_chart_limits_to_n_days() -> None:
+    """With 100 bars and days=30, only the most recent 30 are drawn."""
+    bars = [
+        make_price_bar(symbol="^GSPC", trade_date=D - timedelta(days=i), close=100.0 + i)
+        for i in range(100)
+    ]
+    chart = build_market_price_chart(bars, days=30)
+    assert chart is not None
+    # The underlying dataframe should be tailed.
+    df = chart.data
+    assert len(df) == 30
+
+
+def test_group_stock_predictions_by_sector_buckets_mapped_tickers(session) -> None:
+    """Mapped tickers go into their sector group; unmapped → unmapped pile."""
+    from finn_predictor.storage.repo import ensure_default_sectors
+    ensure_default_sectors(session)
+
+    preds = [
+        make_prediction(target_symbol="AAPL", prediction_date=D, label="UP", confidence=0.55),
+        make_prediction(target_symbol="MSFT", prediction_date=D, label="UP", confidence=0.40),
+        make_prediction(target_symbol="JPM", prediction_date=D, label="DOWN", confidence=0.30),
+        make_prediction(target_symbol="WEIRD42", prediction_date=D, label="FLAT", confidence=0.05),
+    ]
+    grouped, unmapped = group_stock_predictions_by_sector(session, preds)
+
+    # Two sectors should appear (TECH, FIN), each ordered by sector code.
+    sector_codes = [s.code for s, _ in grouped]
+    assert sector_codes == ["FIN", "TECH"]  # sorted by code
+
+    tech_group = next(preds for s, preds in grouped if s.code == "TECH")
+    assert {p.target_symbol for p in tech_group} == {"AAPL", "MSFT"}
+
+    fin_group = next(preds for s, preds in grouped if s.code == "FIN")
+    assert {p.target_symbol for p in fin_group} == {"JPM"}
+
+    assert [p.target_symbol for p in unmapped] == ["WEIRD42"]
+
+
+def test_group_stock_predictions_by_sector_empty_input(session) -> None:
+    from finn_predictor.storage.repo import ensure_default_sectors
+    ensure_default_sectors(session)
+    grouped, unmapped = group_stock_predictions_by_sector(session, [])
+    assert grouped == []
+    assert unmapped == []
+
+
+def test_group_stock_predictions_all_unmapped(session) -> None:
+    """All tickers unmapped → empty groups, full unmapped list."""
+    from finn_predictor.storage.repo import ensure_default_sectors
+    ensure_default_sectors(session)
+    preds = [
+        make_prediction(target_symbol=f"WEIRD{i}", prediction_date=D, label="FLAT", confidence=0.05)
+        for i in range(3)
+    ]
+    grouped, unmapped = group_stock_predictions_by_sector(session, preds)
+    assert grouped == []
+    assert len(unmapped) == 3
 
 
 def test_browser_storage_api_key_is_namespaced() -> None:

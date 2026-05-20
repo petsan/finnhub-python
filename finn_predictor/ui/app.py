@@ -108,7 +108,7 @@ from finn_predictor.storage.models import (
     Sector,
     SentimentScore,
 )
-from finn_predictor.storage.repo import all_sectors, predictions_for
+from finn_predictor.storage.repo import all_sectors, predictions_for, price_bars
 from finn_predictor.storage.clustering import resolve_active_clusterer
 from finn_predictor.storage.stories import earliest_story_times  # noqa: F401  (kept for tests / external imports)
 from finn_predictor.storage.symbol_names import expand_symbol, expand_symbol_short
@@ -363,6 +363,93 @@ def partition_predictions(
         else:
             stocks.append(p)
     return market, sectors, stocks
+
+
+def build_market_price_chart(
+    bars: Iterable["object"], *, symbol: str = "^GSPC", days: int = 30
+) -> alt.Chart | None:
+    """Altair line chart of recent closes for ``symbol``.
+
+    Pan + mouse-wheel zoom come from ``.interactive()`` — the default
+    Altair / Vega-Lite interaction set fits the "look at recent
+    history" use case without bringing in a brush-selection widget.
+
+    Returns ``None`` when there are no bars to draw, so the caller
+    can hide the chart entirely instead of rendering an empty axis
+    (which Altair otherwise still renders with placeholder ticks).
+    """
+    rows = [
+        {"date": b.trade_date, "close": float(b.close), "symbol": symbol}
+        for b in bars
+    ]
+    if not rows:
+        return None
+    df = pd.DataFrame(rows).sort_values("date").tail(days)
+    if df.empty:
+        return None
+    # Keep the y-axis tight: pad ±2% around the visible window's range
+    # so daily candles don't get crushed when the close range is
+    # narrow but the absolute level is high.
+    y_lo = float(df["close"].min())
+    y_hi = float(df["close"].max())
+    pad = max((y_hi - y_lo) * 0.05, abs(y_hi) * 0.005)
+    return (
+        alt.Chart(df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("date:T", title="Date"),
+            y=alt.Y(
+                "close:Q",
+                title=f"{symbol} close",
+                scale=alt.Scale(domain=[y_lo - pad, y_hi + pad]),
+            ),
+            tooltip=[
+                alt.Tooltip("date:T", title="Date"),
+                alt.Tooltip("close:Q", title="Close", format=",.2f"),
+            ],
+        )
+        .properties(height=240)
+        .interactive()  # mouse-wheel zoom, click-drag pan
+    )
+
+
+def group_stock_predictions_by_sector(
+    session: Session, stock_preds: Iterable[Prediction]
+) -> tuple[list[tuple["object", list[Prediction]]], list[Prediction]]:
+    """Bucket ``stock_preds`` by their curated sector.
+
+    Returns ``([(Sector, [pred, …]), …], [unmapped_pred, …])``:
+
+    * The first element is sectors that have at least one mapped
+      stock, ordered by ``Sector.code`` so the UI renders in a
+      stable order across reruns. Each sector's predictions inside
+      keep the caller's input order.
+    * The second element is per-stock predictions whose
+      ``target_symbol`` isn't in the curated map — surfaced as
+      an "Other / unmapped" section by the UI so the user notices
+      and can either add the ticker to the curated map or accept
+      that the stock won't roll up into a sector prediction.
+
+    The Sector objects come from the live DB so the UI gets the
+    user's localised ``name`` and the canonical ``etf_symbol``,
+    not a hard-coded label.
+    """
+    sectors_by_code = {s.code: s for s in all_sectors(session)}
+    from finn_predictor.storage.sector_membership import sector_for_ticker
+
+    by_code: dict[str, list[Prediction]] = {}
+    unmapped: list[Prediction] = []
+    for p in stock_preds:
+        code = sector_for_ticker(p.target_symbol)
+        if code is None or code not in sectors_by_code:
+            unmapped.append(p)
+            continue
+        by_code.setdefault(code, []).append(p)
+    grouped = [
+        (sectors_by_code[code], by_code[code])
+        for code in sorted(by_code.keys())
+    ]
+    return grouped, unmapped
 
 
 def stock_predictions_table(
@@ -1460,6 +1547,26 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                 session, preds
             )
 
+            # ^GSPC price chart at the top — same lookback window as the
+            # rolling baseline (30 days). Pan + mouse-wheel zoom via
+            # Altair's interactive(). Hidden when no bars exist (free-tier
+            # /stock/candle 403 path); yfinance backfill populates them.
+            _gspc_window_end = datetime.now(timezone.utc) + timedelta(days=1)
+            _gspc_window_start = _gspc_window_end - timedelta(days=45)
+            _gspc_bars = price_bars(
+                session, "^GSPC",
+                start=_gspc_window_start, end=_gspc_window_end,
+            )
+            _gspc_chart = build_market_price_chart(
+                _gspc_bars, symbol="^GSPC", days=30,
+            )
+            if _gspc_chart is not None:
+                st.caption(
+                    "^GSPC daily close, last 30 days — scroll to zoom, "
+                    "click-drag to pan."
+                )
+                st.altair_chart(_gspc_chart, use_container_width=True)
+
             if market_pred is None:
                 st.info(
                     "No predictions yet. Paste an API key in the sidebar and "
@@ -1511,39 +1618,86 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                         if i < len(explanation_preds) - 1:
                             st.divider()
 
-            # --- Per-stock predictions --------------------------------
+            # --- Per-stock predictions, grouped by sector ------------
             if stock_preds:
-                st.subheader("Per-stock predictions")
+                st.subheader("Per-stock predictions, grouped by sector")
                 st.caption(
                     "Directional call per ticker, computed from that "
                     "stock's own company-news sentiment. Same classifier "
-                    "as the market call — UP/DOWN/FLAT by z-score against "
-                    "the ticker's 30-day baseline. Sorted by confidence."
+                    "as the market call. Stocks are bucketed by their "
+                    "curated sector membership; each sector header shows "
+                    "that sector's synthesized prediction (when the "
+                    "ingest job had constituents to aggregate). Tickers "
+                    "not in the curated map land in *Other / unmapped*."
                 )
-                stocks_df = stock_predictions_table(session, stock_preds)
-                st.dataframe(
-                    stocks_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Confidence": st.column_config.ProgressColumn(
-                            "Confidence",
-                            min_value=0.0,
-                            max_value=1.0,
-                            format="%.2f",
-                        ),
-                        "Sentiment": st.column_config.NumberColumn(
-                            "Sentiment",
-                            format="%+.3f",
-                            help="Recency-weighted mean of today's "
-                                 "scored articles, on a [-1, +1] scale.",
-                        ),
-                        "As of": st.column_config.DatetimeColumn(
-                            "As of",
-                            format="YYYY-MM-DD",
-                        ),
-                    },
+
+                # Side-channel lookup so each sector header can show
+                # the synthesized sector call alongside the stocks.
+                sector_pred_by_etf = {
+                    sp.target_symbol: sp for sp in sector_preds
+                }
+
+                grouped, unmapped = group_stock_predictions_by_sector(
+                    session, stock_preds
                 )
+
+                _stock_column_config = {
+                    "Confidence": st.column_config.ProgressColumn(
+                        "Confidence",
+                        min_value=0.0,
+                        max_value=1.0,
+                        format="%.2f",
+                    ),
+                    "Sentiment": st.column_config.NumberColumn(
+                        "Sentiment",
+                        format="%+.3f",
+                        help="Recency-weighted mean of today's "
+                             "scored articles, on a [-1, +1] scale.",
+                    ),
+                    "As of": st.column_config.DatetimeColumn(
+                        "As of",
+                        format="YYYY-MM-DD",
+                    ),
+                }
+
+                for sector, preds_in_sector in grouped:
+                    synth = sector_pred_by_etf.get(sector.etf_symbol)
+                    if synth is not None:
+                        sector_header = (
+                            f"#### {sector.name} (`{sector.etf_symbol}`) "
+                            f"— **{synth.label}** · "
+                            f"conf {synth.confidence:.2f} · "
+                            f"{synth.article_count} article(s) "
+                            f"across {len(preds_in_sector)} stock(s)"
+                        )
+                    else:
+                        sector_header = (
+                            f"#### {sector.name} (`{sector.etf_symbol}`) "
+                            f"— *no synthesized prediction yet* · "
+                            f"{len(preds_in_sector)} stock(s)"
+                        )
+                    st.markdown(sector_header)
+                    df = stock_predictions_table(session, preds_in_sector)
+                    st.dataframe(
+                        df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config=_stock_column_config,
+                    )
+
+                if unmapped:
+                    st.markdown(
+                        "#### Other / unmapped — "
+                        f"{len(unmapped)} stock(s) not in the curated "
+                        "sector map"
+                    )
+                    df = stock_predictions_table(session, unmapped)
+                    st.dataframe(
+                        df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config=_stock_column_config,
+                    )
 
             # --- Contribution chart (per-article, divergent bars) ----
             market_contribs: list[ArticleContribution] = []

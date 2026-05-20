@@ -113,16 +113,28 @@ predictions whose next-session close is now available get scored.
 
 The headline view.
 
+* **^GSPC price chart** — at the top, the last 30 days of S&P 500 daily
+  closes. Scroll wheel zooms, click-and-drag pans. Hidden when there
+  are no price bars (e.g. fresh deploy on free-tier Finnhub — click
+  *Backfill prices* in the sidebar to populate via yfinance).
 * **Top tiles** — the market Call, its confidence, and how many
   articles fed it.
 * **Why this Call?** — a scrollable block with five paragraphs per
   prediction (the market call plus any sector calls): call summary,
   mechanics (z-score against the 30-day rolling baseline), top movers,
   counter-signal, and caveats.
-* **Per-stock predictions** — a compact table of every individual
-  ticker that has a prediction today, with company name expanded, a
-  confidence progress bar, articles count, and signed sentiment. Sorted
-  by confidence.
+* **Per-stock predictions, grouped by sector** — one section per
+  sector that has at least one user-listed ticker mapped to it.
+  Each section header carries the **synthesized sector prediction**
+  (UP/DOWN/FLAT + confidence + article count), and the sub-table lists
+  the stocks in that sector with the usual columns: company name,
+  ticker, call, confidence bar, articles, sentiment, and as-of date.
+  Stocks whose tickers aren't in the curated sector map (see
+  `finn_predictor/storage/sector_membership.py`) land in a bottom
+  **Other / unmapped** section. The grouping makes free-tier deploys
+  useful even when Finnhub's `/etf/holdings` endpoint is gated —
+  sector predictions fall back to aggregating your own listed
+  tickers' news instead of needing the official ETF holdings table.
 * **Per-article contribution chart** — divergent vertical bars
   (Altair). The X-axis is article index sorted ascending by signed
   contribution (left = most-negative, right = most-positive), Y-axis

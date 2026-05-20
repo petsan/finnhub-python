@@ -19,6 +19,12 @@ from finn_predictor.storage.clustering import (
     PrefixClusterer,
     resolve_active_clusterer,
 )
+from finn_predictor.storage.sector_membership import (
+    SECTOR_MEMBERSHIP,
+    merge_sector_universes,
+    sector_for_ticker,
+    sector_universe_from_tickers,
+)
 from finn_predictor.storage.stories import earliest_story_times, story_key
 from finn_predictor.storage.symbol_names import (
     WELL_KNOWN_NAMES,
@@ -38,6 +44,7 @@ __all__ = [
     "Prediction",
     "PredictionOutcome",
     "RelatedEntity",
+    "SECTOR_MEMBERSHIP",
     "Sector",
     "SentimentScore",
     "WELL_KNOWN_NAMES",
@@ -46,6 +53,9 @@ __all__ = [
     "expand_symbol",
     "expand_symbol_short",
     "init_db",
+    "merge_sector_universes",
     "resolve_active_clusterer",
+    "sector_for_ticker",
+    "sector_universe_from_tickers",
     "story_key",
 ]

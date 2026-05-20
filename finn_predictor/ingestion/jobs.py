@@ -37,10 +37,15 @@ from finn_predictor.predictor.stocks import predict_all_stocks
 from finn_predictor.sentiment.base import Scorer
 from finn_predictor.storage.models import SentimentScore
 from finn_predictor.storage.repo import (
+    all_sectors,
     ensure_default_sectors,
     related_entities_for,
     save_scores,
     unscored_articles,
+)
+from finn_predictor.storage.sector_membership import (
+    merge_sector_universes,
+    sector_universe_from_tickers,
 )
 
 
@@ -225,11 +230,38 @@ def run_daily_ingest(
     if market_pred is not None:
         counts["predictions"] = int(counts["predictions"]) + 1
 
-    # sector_universe=None means "read cached ETF_HOLDING rows from the
-    # DB". Sectors without cached constituents (i.e. nobody has clicked
-    # *Refresh constituents* in the Focus tab) are skipped silently.
+    # Sector universe — merged from two sources so the dashboard
+    # produces sector predictions even on a free-tier Finnhub plan
+    # (where /etf/holdings is gated and ETF_HOLDING rows can't be
+    # populated):
+    #
+    #   * Primary: cached RelatedEntity(ETF_HOLDING) rows. Populated
+    #     when the user has clicked *Refresh constituents* in the
+    #     Focus tab, OR run `cli refresh-constituents` on a paid plan.
+    #   * Secondary: curated ticker→sector map applied to the user's
+    #     ``company_symbols`` list. Free-tier-friendly fallback —
+    #     mega-caps a user is likely to list get assigned to their
+    #     SPDR-sector code (see storage/sector_membership.py).
+    #
+    # `merge_sector_universes` unions both. Sectors with at least one
+    # constituent from either source produce a prediction; sectors
+    # with none stay silent (predict_all_sectors's existing skip
+    # logic).
+    cached_universe: dict[str, list[str]] = {}
+    seeded_sectors = all_sectors(session)
+    for sector in seeded_sectors:
+        rows = related_entities_for(
+            session, sector.etf_symbol, relationship="ETF_HOLDING"
+        )
+        if rows:
+            cached_universe[sector.code] = [r.related_symbol for r in rows]
+    derived_universe = sector_universe_from_tickers(company_symbols)
+    merged_universe = merge_sector_universes(cached_universe, derived_universe)
+
     sector_preds = predict_all_sectors(
-        session, scorer=scorer, on_date=today, **learned_kwargs,
+        session, scorer=scorer, on_date=today,
+        sector_universe=merged_universe if merged_universe else None,
+        **learned_kwargs,
     )
     counts["predictions"] = int(counts["predictions"]) + len(sector_preds)
 
