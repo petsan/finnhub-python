@@ -217,6 +217,112 @@ def test_run_daily_ingest_persists_company_market_caps(session) -> None:
     assert latest_market_caps(session, ["AAPL"]) == {"AAPL": 3_000_000.0}
 
 
+def test_run_daily_ingest_fans_out_caps_across_cached_constituents(session) -> None:
+    """Cached ETF_HOLDING constituents get their caps pulled too, deduped
+    against user-listed company_symbols so we don't repeat work."""
+    from finn_predictor.storage.repo import (
+        ensure_default_sectors,
+        latest_market_caps,
+        upsert_related_entity,
+    )
+
+    ensure_default_sectors(session)
+    # Cache two constituents under XLK; AAPL also appears in company_symbols
+    # so the loop should skip it during the constituent fan-out.
+    upsert_related_entity(
+        session, source_symbol="XLK", related_symbol="AAPL",
+        relationship="ETF_HOLDING", rank=0,
+    )
+    upsert_related_entity(
+        session, source_symbol="XLK", related_symbol="MSFT",
+        relationship="ETF_HOLDING", rank=1,
+    )
+
+    iso = D.date().isoformat()
+
+    def _caps(symbol, _from, to):
+        return {
+            "symbol": symbol,
+            "data": [{"atDate": iso, "marketCapitalization": 1_000_000.0}],
+        }
+
+    gw = MagicMock()
+    gw.general_news.return_value = []
+    gw.company_news.return_value = []
+    gw.stock_candles.return_value = {"s": "no_data"}
+    gw.historical_market_cap.side_effect = _caps
+
+    counts = run_daily_ingest(
+        session=session,
+        gateway=gw,
+        scorer=VaderScorer(),
+        company_symbols=["AAPL"],
+        today=D,
+    )
+    # AAPL was hit once via the company loop (company_caps), MSFT once
+    # via the constituent loop (constituent_caps).
+    assert counts["company_caps"] == 1
+    assert counts["constituent_caps"] == 1
+
+    # Every cached constituent now has a cap row. AAPL was deduped so
+    # we made exactly one historical_market_cap call per unique ticker.
+    caps = latest_market_caps(session, ["AAPL", "MSFT"])
+    assert set(caps.keys()) == {"AAPL", "MSFT"}
+
+    # And the gateway was called per unique ticker — not twice for AAPL.
+    cap_calls = {call.args[0] for call in gw.historical_market_cap.call_args_list}
+    assert "AAPL" in cap_calls and "MSFT" in cap_calls
+    assert gw.historical_market_cap.call_count == 2
+
+
+def test_run_daily_ingest_isolates_constituent_cap_failures(session) -> None:
+    """A 403 on one constituent's caps doesn't block its peers."""
+    from finn_predictor.storage.repo import (
+        ensure_default_sectors,
+        upsert_related_entity,
+    )
+
+    ensure_default_sectors(session)
+    upsert_related_entity(
+        session, source_symbol="XLK", related_symbol="GOOD",
+        relationship="ETF_HOLDING", rank=0,
+    )
+    upsert_related_entity(
+        session, source_symbol="XLK", related_symbol="BAD",
+        relationship="ETF_HOLDING", rank=1,
+    )
+
+    iso = D.date().isoformat()
+
+    def _caps(symbol, _from, to):
+        if symbol == "BAD":
+            raise IngestionError("FinnhubAPI 403: gated")
+        return {
+            "symbol": symbol,
+            "data": [{"atDate": iso, "marketCapitalization": 500_000.0}],
+        }
+
+    gw = MagicMock()
+    gw.general_news.return_value = []
+    gw.company_news.return_value = []
+    gw.stock_candles.return_value = {"s": "no_data"}
+    gw.historical_market_cap.side_effect = _caps
+
+    counts = run_daily_ingest(
+        session=session,
+        gateway=gw,
+        scorer=VaderScorer(),
+        company_symbols=[],
+        today=D,
+    )
+    assert counts["constituent_caps"] == 1  # GOOD landed
+    bad_fail = [
+        f for f in counts["failures"]
+        if f["op"] == "constituent_caps:BAD"
+    ]
+    assert len(bad_fail) == 1
+
+
 def test_build_scheduler_registers_job() -> None:
     called: list[int] = []
 

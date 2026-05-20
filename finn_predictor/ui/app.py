@@ -98,7 +98,7 @@ from finn_predictor.predictor.trades import (
     rolling_hit_rate,
     trades_dataframe,
 )
-from finn_predictor.sentiment import resolve_active_scorer
+from finn_predictor.sentiment import resolve_active_scorer, warn_if_scorer_mismatch
 from finn_predictor.storage import create_engine_and_session, init_db
 from finn_predictor.storage.models import (
     NewsArticle,
@@ -639,10 +639,14 @@ def run_ingestion_with_key(
             rate_limiter=RateLimiter(rate_limit_per_minute),
         )
         try:
+            scorer = resolve_active_scorer()
+            # One-shot WARNING if the env-configured scorer no longer
+            # matches the model_version on the most recent prediction.
+            warn_if_scorer_mismatch(session, active_scorer=scorer)
             counts = run_daily_ingest(
                 session=session,
                 gateway=gateway,
-                scorer=resolve_active_scorer(),
+                scorer=scorer,
                 company_symbols=list(company_symbols),
             )
         except IngestionError:

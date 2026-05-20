@@ -7,8 +7,10 @@ import pytest
 from finn_predictor.sentiment import (
     Scorer,
     VaderScorer,
+    detect_scorer_mismatch,
     get_scorer,
     resolve_active_scorer,
+    warn_if_scorer_mismatch,
 )
 from finn_predictor.sentiment.finbert import FinBertScorer
 
@@ -130,3 +132,67 @@ def test_resolve_active_scorer_falls_back_on_unknown(monkeypatch) -> None:
 def test_resolve_active_scorer_falls_back_on_blank(monkeypatch) -> None:
     monkeypatch.setenv("FINN_PREDICTOR_SCORER", "")
     assert isinstance(resolve_active_scorer(), VaderScorer)
+
+
+# --- Scorer-mismatch detection ----------------------------------------
+
+
+def _seed_prediction_with_version(session, version: str, *, days_ago: int = 1) -> None:
+    """Insert one Prediction with the given model_version."""
+    from datetime import datetime, timedelta, timezone
+
+    from finn_predictor.storage.models import Prediction
+    from finn_predictor.storage.repo import save_prediction
+
+    save_prediction(
+        session,
+        Prediction(
+            target_symbol="^GSPC",
+            prediction_date=datetime.now(timezone.utc) - timedelta(days=days_ago),
+            label="FLAT",
+            confidence=0.0,
+            sentiment_index=0.0,
+            article_count=0,
+            model_version=version,
+        ),
+    )
+
+
+def test_detect_scorer_mismatch_returns_none_on_empty_db(session) -> None:
+    assert detect_scorer_mismatch(session, active_scorer=VaderScorer()) is None
+
+
+def test_detect_scorer_mismatch_returns_none_when_matched(session) -> None:
+    v = VaderScorer()
+    _seed_prediction_with_version(session, v.model_version)
+    assert detect_scorer_mismatch(session, active_scorer=v) is None
+
+
+def test_detect_scorer_mismatch_returns_message_on_drift(session) -> None:
+    """Latest prediction was written under finbert, live scorer is VADER."""
+    _seed_prediction_with_version(session, "finbert-prosusai-1.0")
+    msg = detect_scorer_mismatch(session, active_scorer=VaderScorer())
+    assert msg is not None
+    assert "finbert-prosusai-1.0" in msg
+    assert "vader" in msg.lower()
+
+
+def test_warn_if_scorer_mismatch_logs_at_warning_level(session, caplog) -> None:
+    import logging
+
+    _seed_prediction_with_version(session, "finbert-prosusai-1.0")
+    with caplog.at_level(logging.WARNING, logger="finn_predictor.sentiment"):
+        msg = warn_if_scorer_mismatch(session, active_scorer=VaderScorer())
+    assert msg is not None
+    assert any("scorer mismatch" in r.message for r in caplog.records)
+
+
+def test_warn_if_scorer_mismatch_silent_on_match(session, caplog) -> None:
+    import logging
+
+    v = VaderScorer()
+    _seed_prediction_with_version(session, v.model_version)
+    with caplog.at_level(logging.WARNING, logger="finn_predictor.sentiment"):
+        msg = warn_if_scorer_mismatch(session, active_scorer=v)
+    assert msg is None
+    assert not [r for r in caplog.records if "scorer mismatch" in r.message]

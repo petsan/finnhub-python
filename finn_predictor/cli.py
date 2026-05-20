@@ -210,7 +210,7 @@ def cmd_ingest() -> int:
     from finn_predictor.config import load_settings
     from finn_predictor.ingestion.client import FinnhubGateway, RateLimiter
     from finn_predictor.ingestion.jobs import run_daily_ingest
-    from finn_predictor.sentiment import get_scorer
+    from finn_predictor.sentiment import get_scorer, warn_if_scorer_mismatch
     from finnhub import Client as FinnhubClient
 
     try:
@@ -252,6 +252,9 @@ def cmd_ingest() -> int:
             rate_limiter=RateLimiter(settings.rate_limit_per_minute),
         )
         with SessionLocal() as session:
+            # Surface a one-line mismatch warning when the live scorer
+            # doesn't match the most-recent prediction's model_version.
+            warn_if_scorer_mismatch(session, active_scorer=scorer)
             counts = run_daily_ingest(
                 session=session,
                 gateway=gateway,

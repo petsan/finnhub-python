@@ -34,6 +34,7 @@ from finn_predictor.sentiment.base import Scorer
 from finn_predictor.storage.models import SentimentScore
 from finn_predictor.storage.repo import (
     ensure_default_sectors,
+    related_entities_for,
     save_scores,
     unscored_articles,
 )
@@ -88,6 +89,7 @@ def run_daily_ingest(
         "sector_prices": 0,
         "company_prices": 0,
         "company_caps": 0,
+        "constituent_caps": 0,
         "scored": 0,
         "predictions": 0,
     }
@@ -121,6 +123,11 @@ def run_daily_ingest(
             ),
         )
 
+    # Track every ticker we've already pulled caps for so the
+    # constituent fan-out below doesn't make redundant API calls for
+    # symbols the user already listed explicitly.
+    caps_ingested: set[str] = set()
+
     for symbol in company_symbols:
         counts["company_news"] = int(counts["company_news"]) + _try(
             f"company_news:{symbol}",
@@ -144,6 +151,32 @@ def run_daily_ingest(
                 session, gateway, symbol=sym, start=yesterday, end=today
             ),
         )
+        caps_ingested.add(symbol)
+
+    # Cap fan-out across cached sector constituents. Sectors whose
+    # ETF_HOLDING rows have been refreshed (via the Focus tab's
+    # *Refresh constituents* button) now get cap weighting too —
+    # without this, predict_sector falls back to uniform for any
+    # constituent the user hasn't explicitly listed in company_symbols.
+    #
+    # Rate-limit by the gateway's existing limiter; per-symbol
+    # failures isolated like the loops above. Symbols already pulled
+    # in the company_symbols loop above are skipped via caps_ingested.
+    for sector in sectors:
+        constituents = related_entities_for(
+            session, sector.etf_symbol, relationship="ETF_HOLDING"
+        )
+        for row in constituents:
+            sym = (row.related_symbol or "").strip()
+            if not sym or sym in caps_ingested:
+                continue
+            counts["constituent_caps"] = int(counts["constituent_caps"]) + _try(
+                f"constituent_caps:{sym}",
+                lambda s=sym: ingest_market_caps(
+                    session, gateway, symbol=s, start=yesterday, end=today
+                ),
+            )
+            caps_ingested.add(sym)
 
     # Scoring + predictions are DB-only operations — they always run, even if
     # every Finnhub fetch above failed, because there may be older articles

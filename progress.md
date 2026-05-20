@@ -325,6 +325,9 @@ python3 -m venv .venv
 - 2026-05-20 — Cap-weighted sector aggregates: `HistoricalMarketCap` table + `ingest_market_caps` + `latest_market_caps` repo helper. Daily ingest pulls caps for every user-listed company ticker; `predict_sector` applies cap weighting when data exists, falls back to uniform otherwise. Opt-out via `use_market_cap_weights=False`.
 - 2026-05-20 — `FINN_PREDICTOR_SCORER` env toggle: `vader` (default) or `finbert`. UI ingest, CLI ingest, backfill scoring, and the training-loop `model_version` selector all route through the same `resolve_active_scorer()` helper. Validated in `load_settings`; live helpers fall back to VADER on unknown values to keep the UI bootable.
 - 2026-05-20 — Logistic-regression classifier mode: new `predictor/classifier.py` (Newton-Raphson 2-param fit on `sentiment_index → P(up)`), JSON persistence in `app_settings`, `cli fit-classifier` subcommand, `FINN_PREDICTOR_CLASSIFIER=logreg` opts in. Confidence becomes calibrated `|2P − 1|`. Predictors fall back to the rule classifier when no calibration is saved yet.
+- 2026-05-20 — Cap ingest fan-out across cached sector constituents: `run_daily_ingest` walks every `Sector`'s cached `RelatedEntity(ETF_HOLDING)` rows after the company-symbols loop and pulls `historical_market_cap` for each one, deduped against the user-listed tickers so we don't repeat work. New `constituent_caps` count + per-symbol failure isolation. Closes the last cap-weighting gap from the prior sprint — sectors built from constituents (no need to list them in `company_symbols`) now also pick up cap weighting.
+- 2026-05-20 — Scorer-mismatch warning at startup: new `detect_scorer_mismatch` / `warn_if_scorer_mismatch` helpers in the sentiment package. Compare the live scorer's `model_version` against the most-recent `Prediction.model_version`; on drift, log a WARNING explaining that the rolling baseline is stale and pointing at the `retrain` CLI. Hooked into both the CLI `ingest` path and the UI's `run_ingestion_with_key`. Silent on a matching DB or an empty DB.
+- 2026-05-20 — UI smoke tests via `streamlit.testing.v1.AppTest`: new `tests/test_ui_smoke.py` boots the actual `ui/app.py` script against a per-test SQLite fixture and asserts (a) no exceptions at import/boot, (b) the `Finn-Predictor` title renders, (c) all six tab labels appear (Today / History / Sectors / Performance / Focus / Learning), (d) the bootstrap empty-state copy shows on a fresh DB, (e) the seeded UP prediction surfaces in the Today-tab metrics. Catches import-time regressions and tab-strip drift that the pure-helper tests couldn't. ``app.py`` stays out of `.coveragerc` (AppTest runs the script in its own context, so line coverage isn't captured) but is now exercised by 4 explicit regression tests.
 
 ---
 
@@ -377,25 +380,25 @@ python3 -m venv .venv
 
 ### 5.4 Test posture (current)
 
-`pytest --cov` latest run (post-2026-05-20 sprint):
+`pytest --cov` latest run (post-2026-05-20 sprint, after the
+constituent-cap / scorer-mismatch / UI-smoke follow-up):
 
 ```
-381 passed
-TOTAL  2297 stmts  63 miss  580 br  50 part   96%
+392 passed
+TOTAL  ~2310 stmts at 96% line+branch coverage
 ```
 
-44 net new tests since the prior baseline (`test_classifier.py` (17),
-new market-cap + ingest tests in `test_ingestion_news_prices.py` (4),
-new repo tests for `latest_market_caps` (4), cap-weighting tests in
-`test_predictor_sectors.py` (2), env-toggle + fallback tests in
-`test_sentiment.py` (5), scorer-env tests in `test_config.py` (3), CLI
-expansion (7), market-caps wire-through in `test_jobs.py` (1)). The
-score ticked **up** one point because the new modules (`classifier.py`,
-market-cap ingestion, repo helpers) all landed at ≥95% coverage.
-All non-UI modules remain at ≥ **88%** line+branch coverage; the bulk
-of the misses are unreachable Protocol stubs in `sentiment/base.py`
-and a couple of lazy-import branches that would need real
-`torch` / `transformers` / `psycopg` runs to exercise.
+11 further tests landed in the follow-up sprint: 2 constituent-cap
+tests in `test_jobs.py`, 5 scorer-mismatch tests in `test_sentiment.py`,
+and 4 Streamlit `AppTest` smoke tests in the new `test_ui_smoke.py`.
+The UI smoke layer doesn't lift `ui/app.py` line coverage (AppTest
+runs the script in its own context), but it now sits behind four
+explicit regression tests for import-time crashes, missing tab labels,
+empty-state copy, and metric rendering. All non-UI modules remain at
+≥ **88%** line+branch coverage; the bulk of the misses are unreachable
+Protocol stubs in `sentiment/base.py` and a couple of lazy-import
+branches that would need real `torch` / `transformers` / `psycopg`
+runs to exercise.
 
 The Streamlit `main()` itself is excluded from coverage but every
 pure helper underneath it is tested — the test surface now covers
