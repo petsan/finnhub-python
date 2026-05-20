@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from finn_predictor.storage.models import (
     AppSetting,
+    HistoricalMarketCap,
     LearnedWeight,
     NewsArticle,
     PriceBar,
@@ -213,6 +214,73 @@ def latest_price_bar(session: Session, symbol: str) -> Optional[PriceBar]:
         .limit(1)
     )
     return session.scalars(stmt).first()
+
+
+# -- Market caps ------------------------------------------------------------
+
+
+def upsert_market_caps(
+    session: Session, caps: Iterable[HistoricalMarketCap]
+) -> int:
+    """Insert market-cap rows, skipping ``(symbol, as_of_date)`` duplicates.
+
+    Mirrors :func:`upsert_price_bars`: dialect-aware insert builder, no-op
+    on conflict, returns the number of newly inserted rows.
+    """
+    inserted = 0
+    insert_builder = _dialect_insert(session)
+    for cap in caps:
+        stmt = (
+            insert_builder(HistoricalMarketCap)
+            .values(
+                symbol=cap.symbol,
+                as_of_date=cap.as_of_date,
+                market_cap=float(cap.market_cap),
+            )
+            .on_conflict_do_nothing(index_elements=["symbol", "as_of_date"])
+        )
+        result = session.execute(stmt)
+        inserted += result.rowcount or 0
+    session.commit()
+    return inserted
+
+
+def latest_market_caps(
+    session: Session,
+    symbols: Iterable[str],
+    *,
+    on_or_before: Optional[datetime] = None,
+) -> dict[str, float]:
+    """Return ``{symbol: market_cap}`` using the most recent known snapshot.
+
+    Symbols with no cap rows are simply absent from the result — callers
+    decide the fallback (typically a uniform 1.0 weight). When
+    ``on_or_before`` is given, only snapshots dated at-or-before that
+    point are considered, which keeps the historical backtester
+    look-ahead-free.
+    """
+    out: dict[str, float] = {}
+    for sym in symbols:
+        stmt = (
+            select(HistoricalMarketCap)
+            .where(HistoricalMarketCap.symbol == sym)
+            .order_by(HistoricalMarketCap.as_of_date.desc())
+            .limit(1)
+        )
+        if on_or_before is not None:
+            stmt = (
+                select(HistoricalMarketCap)
+                .where(
+                    HistoricalMarketCap.symbol == sym,
+                    HistoricalMarketCap.as_of_date <= on_or_before,
+                )
+                .order_by(HistoricalMarketCap.as_of_date.desc())
+                .limit(1)
+            )
+        row = session.scalars(stmt).first()
+        if row is not None and row.market_cap > 0:
+            out[sym] = float(row.market_cap)
+    return out
 
 
 # -- Predictions ------------------------------------------------------------

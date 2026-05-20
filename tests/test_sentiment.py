@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from finn_predictor.sentiment import Scorer, VaderScorer, get_scorer
+from finn_predictor.sentiment import (
+    Scorer,
+    VaderScorer,
+    get_scorer,
+    resolve_active_scorer,
+)
 from finn_predictor.sentiment.finbert import FinBertScorer
 
 
@@ -99,3 +104,29 @@ def test_finbert_get_scorer_lazy_import() -> None:
     fb = get_scorer("finbert")
     assert isinstance(fb, FinBertScorer)
     # We do NOT call .score() to avoid pulling torch.
+
+
+def test_resolve_active_scorer_defaults_to_vader(monkeypatch) -> None:
+    monkeypatch.delenv("FINN_PREDICTOR_SCORER", raising=False)
+    assert isinstance(resolve_active_scorer(), VaderScorer)
+
+
+def test_resolve_active_scorer_honours_finbert_env(monkeypatch) -> None:
+    monkeypatch.setenv("FINN_PREDICTOR_SCORER", "finbert")
+    assert isinstance(resolve_active_scorer(), FinBertScorer)
+
+
+def test_resolve_active_scorer_is_case_insensitive(monkeypatch) -> None:
+    monkeypatch.setenv("FINN_PREDICTOR_SCORER", "  FinBERT  ")
+    assert isinstance(resolve_active_scorer(), FinBertScorer)
+
+
+def test_resolve_active_scorer_falls_back_on_unknown(monkeypatch) -> None:
+    """Unrecognised env values shouldn't crash the UI at startup."""
+    monkeypatch.setenv("FINN_PREDICTOR_SCORER", "magic-llm")
+    assert isinstance(resolve_active_scorer(), VaderScorer)
+
+
+def test_resolve_active_scorer_falls_back_on_blank(monkeypatch) -> None:
+    monkeypatch.setenv("FINN_PREDICTOR_SCORER", "")
+    assert isinstance(resolve_active_scorer(), VaderScorer)

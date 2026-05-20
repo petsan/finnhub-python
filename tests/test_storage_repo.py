@@ -11,6 +11,7 @@ from finn_predictor.storage.repo import (
     all_sectors,
     articles_in_window,
     ensure_default_sectors,
+    latest_market_caps,
     latest_price_bar,
     migrate_predictions_to_daily,
     price_bars,
@@ -20,10 +21,11 @@ from finn_predictor.storage.repo import (
     save_scores,
     unscored_articles,
     upsert_articles,
+    upsert_market_caps,
     upsert_price_bars,
     utc_day_window,
 )
-from finn_predictor.storage.models import PredictionOutcome
+from finn_predictor.storage.models import HistoricalMarketCap, PredictionOutcome
 from tests.conftest import (
     make_article,
     make_prediction,
@@ -298,3 +300,66 @@ def test_utc_day_window_normalises_to_midnight() -> None:
     assert start.tzinfo is timezone.utc
     assert start.hour == 0 and start.minute == 0
     assert end - start == timedelta(days=1)
+
+
+# -- Market caps ---------------------------------------------------------
+
+
+def _cap(symbol: str, day: datetime, value: float) -> HistoricalMarketCap:
+    return HistoricalMarketCap(symbol=symbol, as_of_date=day, market_cap=value)
+
+
+def test_upsert_market_caps_dedupes_on_symbol_date(session) -> None:
+    """The (symbol, as_of_date) unique constraint silences duplicate inserts."""
+    d = D0
+    rows = [_cap("AAPL", d, 1.0), _cap("AAPL", d, 9.9), _cap("AAPL", d, 2.5)]
+    n = upsert_market_caps(session, rows)
+    assert n == 1
+    caps = latest_market_caps(session, ["AAPL"])
+    # First write wins; subsequent values for the same day no-op (matches
+    # the no-update semantics of upsert_price_bars).
+    assert caps == {"AAPL": pytest.approx(1.0)}
+
+
+def test_latest_market_caps_returns_latest_per_symbol(session) -> None:
+    """Multiple snapshots per symbol → only the most recent appears."""
+    day_old = D0 - timedelta(days=5)
+    day_new = D0
+    upsert_market_caps(
+        session,
+        [
+            _cap("AAPL", day_old, 2_800_000.0),
+            _cap("AAPL", day_new, 2_910_000.0),
+            _cap("MSFT", day_old, 3_000_000.0),
+        ],
+    )
+    caps = latest_market_caps(session, ["AAPL", "MSFT", "NONE"])
+    assert caps == {
+        "AAPL": pytest.approx(2_910_000.0),
+        "MSFT": pytest.approx(3_000_000.0),
+    }
+    assert "NONE" not in caps
+
+
+def test_latest_market_caps_honours_on_or_before(session) -> None:
+    """Look-ahead bias guard: only snapshots ≤ cutoff are considered."""
+    day_old = D0 - timedelta(days=5)
+    day_new = D0
+    upsert_market_caps(
+        session,
+        [
+            _cap("AAPL", day_old, 2_800_000.0),
+            _cap("AAPL", day_new, 2_910_000.0),
+        ],
+    )
+    caps = latest_market_caps(
+        session, ["AAPL"], on_or_before=D0 - timedelta(days=1)
+    )
+    assert caps == {"AAPL": pytest.approx(2_800_000.0)}
+
+
+def test_latest_market_caps_skips_non_positive_values(session) -> None:
+    """A zero / negative cap row is treated as missing."""
+    upsert_market_caps(session, [_cap("WEIRD", D0, 0.0)])
+    caps = latest_market_caps(session, ["WEIRD"])
+    assert caps == {}

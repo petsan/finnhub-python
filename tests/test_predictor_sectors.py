@@ -5,12 +5,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from finn_predictor.predictor.sectors import predict_all_sectors, predict_sector
-from finn_predictor.storage.models import Sector
+from finn_predictor.storage.models import HistoricalMarketCap, Sector
 from finn_predictor.storage.repo import (
     ensure_default_sectors,
     predictions_for,
     save_scores,
     upsert_articles,
+    upsert_market_caps,
 )
 
 from tests.conftest import make_article, make_score
@@ -222,6 +223,79 @@ def test_predict_sector_normalises_prediction_date(session) -> None:
     assert a.id == b.id
     rows = predictions_for(session, "XLRE")
     assert len(rows) == 1
+
+
+def test_predict_sector_cap_weighting_shifts_sentiment(session) -> None:
+    """A 1000× larger cap on the bullish ticker flips the sector to UP.
+
+    With uniform weights, three positive AAPL scores and three negative
+    XOM scores cancel — sentiment ≈ 0, label = FLAT. Once we tell the
+    cap lookup AAPL is 1000× XOM, the weighted mean leans strongly
+    positive and we get UP.
+    """
+    sector = Sector(code="TECH", name="Tech", etf_symbol="XLK")
+    session.add(sector)
+    session.commit()
+
+    _seed_company_articles(session, symbol="AAPL", scores=[0.9, 0.85, 0.95])
+    _seed_company_articles(session, symbol="GENERIC_SMALL", scores=[-0.9, -0.85, -0.95])
+
+    # Confirm the uniform-weight case (cap weighting disabled) is mixed.
+    uniform = predict_sector(
+        session,
+        scorer=_FixedScorer(),
+        sector=sector,
+        sector_symbols=["AAPL", "GENERIC_SMALL"],
+        on_date=D,
+        use_market_cap_weights=False,
+    )
+    assert uniform is not None
+    assert uniform.label in {"FLAT"}
+    assert abs(uniform.sentiment_index) < 1e-6
+
+    # Now seed market caps: AAPL is 1000× the small-cap. Cap weighting on
+    # (default) should swing the call to UP.
+    upsert_market_caps(
+        session,
+        [
+            HistoricalMarketCap(
+                symbol="AAPL", as_of_date=D, market_cap=3_000_000.0
+            ),
+            HistoricalMarketCap(
+                symbol="GENERIC_SMALL", as_of_date=D, market_cap=3_000.0
+            ),
+        ],
+    )
+    weighted = predict_sector(
+        session,
+        scorer=_FixedScorer(),
+        sector=sector,
+        sector_symbols=["AAPL", "GENERIC_SMALL"],
+        on_date=D,
+    )
+    assert weighted is not None
+    assert weighted.label == "UP"
+    assert weighted.sentiment_index > 0.5
+
+
+def test_predict_sector_cap_weighting_falls_back_to_uniform_without_caps(session) -> None:
+    """No cap rows for any constituent → cap-weighted run matches uniform."""
+    sector = Sector(code="ENERGY", name="Energy", etf_symbol="XLE")
+    session.add(sector)
+    session.commit()
+    _seed_company_articles(session, symbol="XOM", scores=[-0.5, -0.6, -0.7])
+
+    cap_on = predict_sector(
+        session, scorer=_FixedScorer(), sector=sector,
+        sector_symbols=["XOM"], on_date=D, use_market_cap_weights=True,
+    )
+    cap_off = predict_sector(
+        session, scorer=_FixedScorer(), sector=sector,
+        sector_symbols=["XOM"], on_date=D, use_market_cap_weights=False,
+    )
+    assert cap_on is not None and cap_off is not None
+    assert cap_on.sentiment_index == cap_off.sentiment_index
+    assert cap_on.label == cap_off.label
 
 
 def test_predict_sector_persists_through_repo(session) -> None:

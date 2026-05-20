@@ -289,9 +289,10 @@ python3 -m venv .venv
 ```
 
 ### 3.6 Known limitations / next steps
-- Market-cap weighting for sector aggregates is wired through but not populated yet (no `historical_market_cap` ingestion). Weights default to uniform.
-- FinBERT activation is gated on someone running `get_scorer("finbert")`; we ship without `torch`/`transformers` to keep CI cheap.
-- The threshold model is a rule, not a fitted classifier — a downstream task can swap in a logistic regression that reads from the `predictions`/`prediction_outcomes` tables for training.
+- ~~Market-cap weighting for sector aggregates is wired through but not populated yet (no `historical_market_cap` ingestion). Weights default to uniform.~~ **Closed 2026-05-20**: `historical_market_cap` is now part of the daily ingest for every user-listed company ticker; `predict_sector` cap-weights articles when caps exist and silently falls back to uniform otherwise.
+- ~~FinBERT activation is gated on someone running `get_scorer("finbert")`.~~ **Closed 2026-05-20**: set `FINN_PREDICTOR_SCORER=finbert` to flip the live pipeline. VADER stays default; FinBERT requires `pip install torch transformers`. The training loop reads the matching `model_version` automatically.
+- ~~The threshold model is a rule, not a fitted classifier.~~ **Closed 2026-05-20**: `FINN_PREDICTOR_CLASSIFIER=logreg` switches the final decision to a fitted logistic regression of `P(up | sentiment_index)`. Fit with `python -m finn_predictor.cli fit-classifier`; confidence becomes `|2P − 1|` (calibrated probability gap). Defaults to `rule` so existing deploys are unaffected.
+- Story clustering is a heuristic — first-8-word headline prefix match. Wires that paraphrase heavily won't cluster; unrelated leads occasionally collide. An embedding-based clusterer is the natural next step.
 - No live trading. Predictions are purely informational and the UI is read-only.
 
 ---
@@ -320,6 +321,10 @@ python3 -m venv .venv
 - 2026-05-19 — User manual + installation manual added (`c8e6314`).
 - 2026-05-19 — Half-life + source weights actually applied at live scoring time; `predict_all_sectors` defaults to reading constituent universe from cached `ETF_HOLDING` rows (`3b9f296`).
 - 2026-05-19 — Production hardening: bcrypt auth gate around the UI, non-root Docker user, Postgres dialect support, structured JSON logging with `SecretScrubFilter` on every handler, CLI `ingest` + `hash-password` subcommands (`bbfb07e`).
+- 2026-05-20 — CLI test coverage lift (`cmd_ingest`, hash-password stdin/ValueError, retrain --activate yes/no): cli.py 77% → 96%.
+- 2026-05-20 — Cap-weighted sector aggregates: `HistoricalMarketCap` table + `ingest_market_caps` + `latest_market_caps` repo helper. Daily ingest pulls caps for every user-listed company ticker; `predict_sector` applies cap weighting when data exists, falls back to uniform otherwise. Opt-out via `use_market_cap_weights=False`.
+- 2026-05-20 — `FINN_PREDICTOR_SCORER` env toggle: `vader` (default) or `finbert`. UI ingest, CLI ingest, backfill scoring, and the training-loop `model_version` selector all route through the same `resolve_active_scorer()` helper. Validated in `load_settings`; live helpers fall back to VADER on unknown values to keep the UI bootable.
+- 2026-05-20 — Logistic-regression classifier mode: new `predictor/classifier.py` (Newton-Raphson 2-param fit on `sentiment_index → P(up)`), JSON persistence in `app_settings`, `cli fit-classifier` subcommand, `FINN_PREDICTOR_CLASSIFIER=logreg` opts in. Confidence becomes calibrated `|2P − 1|`. Predictors fall back to the rule classifier when no calibration is saved yet.
 
 ---
 
@@ -372,19 +377,25 @@ python3 -m venv .venv
 
 ### 5.4 Test posture (current)
 
-`pytest --cov` latest run:
+`pytest --cov` latest run (post-2026-05-20 sprint):
 
 ```
-337 passed
-TOTAL  2064 stmts  80 miss  518 br  46 part   95%
+381 passed
+TOTAL  2297 stmts  63 miss  580 br  50 part   96%
 ```
 
-The score dipped slightly from 98% as we added the bigger packages
-(`learning/`, `focus.py`, `cli.py`, the Performance + Focus + Learning
-UI tabs). All non-UI modules remain at ≥ **88%** line+branch coverage;
-the bulk of the misses are unreachable Protocol stubs in
-`sentiment/base.py` and a couple of lazy-import branches that would
-need real `torch` / `transformers` / `psycopg` runs to exercise.
+44 net new tests since the prior baseline (`test_classifier.py` (17),
+new market-cap + ingest tests in `test_ingestion_news_prices.py` (4),
+new repo tests for `latest_market_caps` (4), cap-weighting tests in
+`test_predictor_sectors.py` (2), env-toggle + fallback tests in
+`test_sentiment.py` (5), scorer-env tests in `test_config.py` (3), CLI
+expansion (7), market-caps wire-through in `test_jobs.py` (1)). The
+score ticked **up** one point because the new modules (`classifier.py`,
+market-cap ingestion, repo helpers) all landed at ≥95% coverage.
+All non-UI modules remain at ≥ **88%** line+branch coverage; the bulk
+of the misses are unreachable Protocol stubs in `sentiment/base.py`
+and a couple of lazy-import branches that would need real
+`torch` / `transformers` / `psycopg` runs to exercise.
 
 The Streamlit `main()` itself is excluded from coverage but every
 pure helper underneath it is tested — the test surface now covers

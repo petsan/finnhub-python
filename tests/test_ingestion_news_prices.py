@@ -8,8 +8,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from finn_predictor.ingestion.news import ingest_company_news, ingest_general_news
-from finn_predictor.ingestion.prices import ingest_price_history
-from finn_predictor.storage.repo import articles_in_window, price_bars
+from finn_predictor.ingestion.prices import ingest_market_caps, ingest_price_history
+from finn_predictor.storage.models import HistoricalMarketCap
+from finn_predictor.storage.repo import (
+    articles_in_window,
+    latest_market_caps,
+    price_bars,
+)
 
 
 D = datetime(2026, 5, 19, 12, tzinfo=timezone.utc)
@@ -141,6 +146,92 @@ def test_ingest_price_history_handles_naive_start_end(session) -> None:
     args = gw.stock_candles.call_args
     assert isinstance(args.args[2], int) and args.args[2] > 0
     assert isinstance(args.args[3], int) and args.args[3] > args.args[2]
+
+
+def test_ingest_market_caps_persists_rows(session) -> None:
+    """Happy path: parses atDate + marketCapitalization, upserts via repo."""
+    payload = {
+        "symbol": "AAPL",
+        "data": [
+            {"atDate": "2026-05-18", "marketCapitalization": 2_900_000.0},
+            {"atDate": "2026-05-19", "marketCapitalization": 2_910_000.0},
+        ],
+    }
+    gw = MagicMock()
+    gw.historical_market_cap.return_value = payload
+
+    n = ingest_market_caps(
+        session,
+        gw,
+        symbol="AAPL",
+        start=D - timedelta(days=2),
+        end=D,
+    )
+    assert n == 2
+
+    # Gateway was called with ISO date strings, not epoch ints.
+    args = gw.historical_market_cap.call_args.args
+    assert args[0] == "AAPL"
+    assert args[1] == (D - timedelta(days=2)).date().isoformat()
+    assert args[2] == D.date().isoformat()
+
+    caps = latest_market_caps(session, ["AAPL"])
+    assert caps == {"AAPL": pytest.approx(2_910_000.0)}
+
+
+def test_ingest_market_caps_handles_empty_payload(session) -> None:
+    """Missing / empty ``data`` is a successful no-op (free-tier-friendly)."""
+    gw = MagicMock()
+    gw.historical_market_cap.return_value = {"symbol": "XYZ"}
+    assert (
+        ingest_market_caps(
+            session, gw, symbol="XYZ", start=D - timedelta(days=2), end=D
+        )
+        == 0
+    )
+
+    gw.historical_market_cap.return_value = {"symbol": "XYZ", "data": []}
+    assert (
+        ingest_market_caps(
+            session, gw, symbol="XYZ", start=D - timedelta(days=2), end=D
+        )
+        == 0
+    )
+
+
+def test_ingest_market_caps_skips_malformed_rows(session) -> None:
+    """Bad dates, missing caps, and non-positive caps drop silently."""
+    payload = {
+        "symbol": "WAT",
+        "data": [
+            {"atDate": "not-a-date", "marketCapitalization": 100.0},
+            {"atDate": "2026-05-19"},  # missing cap
+            {"atDate": "2026-05-19", "marketCapitalization": "abc"},  # not numeric
+            {"atDate": "2026-05-19", "marketCapitalization": 0},  # non-positive
+            {"atDate": "2026-05-19", "marketCapitalization": 123.0},  # the one good row
+        ],
+    }
+    gw = MagicMock()
+    gw.historical_market_cap.return_value = payload
+
+    n = ingest_market_caps(
+        session, gw, symbol="WAT", start=D - timedelta(days=2), end=D
+    )
+    assert n == 1
+    caps = latest_market_caps(session, ["WAT"])
+    assert caps == {"WAT": pytest.approx(123.0)}
+
+
+def test_ingest_market_caps_is_idempotent(session) -> None:
+    """Running the same window twice inserts nothing the second time."""
+    payload = {
+        "symbol": "MSFT",
+        "data": [{"atDate": "2026-05-19", "marketCapitalization": 3_000_000.0}],
+    }
+    gw = MagicMock()
+    gw.historical_market_cap.return_value = payload
+    assert ingest_market_caps(session, gw, symbol="MSFT", start=D, end=D) == 1
+    assert ingest_market_caps(session, gw, symbol="MSFT", start=D, end=D) == 0
 
 
 def test_ingest_price_history_raises_on_mismatched_arrays(session) -> None:

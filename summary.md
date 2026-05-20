@@ -132,6 +132,9 @@ of up to a year.
 | Activation policy | `AUTO` (newest version wins) or `MANUAL` (user clicks Activate). Persisted across Streamlit restarts via an `app_settings` table. |
 | Holdout-improvement gate | Under AUTO policy, refuses to activate a new version whose holdout score drops by more than the configured tolerance vs. the live config. UI shows the gap + an "Activate anyway" override. |
 | Auth gate | Optional bcrypt password gate around the entire UI. Generate the hash via `python -m finn_predictor.cli hash-password`, set `FINN_PREDICTOR_PASSWORD_HASH`. Unset → no auth (safe default for localhost). |
+| Pluggable scorer | `FINN_PREDICTOR_SCORER=finbert` swaps VADER for FinBERT (requires `pip install torch transformers`); the live pipeline, backfill scoring, and the learning loop's `model_version` selector all route through one helper. |
+| Cap-weighted sectors | Per-sector aggregation multiplies each article's recency × source weight by its company's most-recent market cap (Finnhub `/stock/historical-market-cap`). Tickers without a cap row keep weight 1.0; sectors fall back to uniform when nothing has been ingested. |
+| Calibrated classifier | `FINN_PREDICTOR_CLASSIFIER=logreg` plus a fitted calibration replaces the z-score rule with `P(up) = sigmoid(intercept + beta * sentiment_index)`. Fit via `python -m finn_predictor.cli fit-classifier` once enough outcomes have closed; confidence becomes `|2P − 1|`. |
 | Postgres support | Set `FINN_PREDICTOR_DB_URL="postgresql+psycopg://..."` — the upserts are dialect-aware. `psycopg[binary]` ships in default requirements. |
 | Structured logging | `FINN_PREDICTOR_LOG_FORMAT=json` switches to one-record-per-line JSON output suitable for log aggregators. |
 | Docker | `docker compose up --build` builds and starts the app on host 8501. Named volume keeps the SQLite DB across `down`. `RESET_DB=1` wipes on next start. `docker compose run --rm app ingest|retrain|reset-db|shell|hash-password` for headless ops. Runs as non-root. |
@@ -143,12 +146,22 @@ of up to a year.
 * **`/stock/candle` is gated** on the free tier, so backtest accuracy
   (`prediction_outcomes`) stays empty until you upgrade. Predictions still
   write fine; only the realised-return validation is missing.
-* **Classifier is a rule, not a fitted model.** Confidence is normalised
+* **Default classifier is still a rule.** Confidence is normalised
   z-distance, not probability. Day-1 of a new ticker can pin at conf=1.0
-  before the rolling baseline accumulates 30 days of history.
-* **VADER is general-purpose.** Financial jargon ("beat estimates", "guidance
-  lowered") is under-weighted. FinBERT swap-in is wired but not active by
-  default to keep the dependency tree small.
+  before the rolling baseline accumulates 30 days of history. A calibrated
+  logistic regression is available via `FINN_PREDICTOR_CLASSIFIER=logreg`
+  once you've accumulated ≥10 closed UP/DOWN predictions and run
+  `python -m finn_predictor.cli fit-classifier` — confidence then becomes
+  `|2P − 1|`.
+* **VADER is the default scorer.** Financial jargon ("beat estimates",
+  "guidance lowered") is under-weighted. FinBERT is a one-env-var flip
+  (`FINN_PREDICTOR_SCORER=finbert`) but requires `pip install torch
+  transformers` because we keep the heavy deps out of the default tree.
+* **Sector cap weights default uniform when caps haven't ingested yet.**
+  Daily ingest now pulls `historical_market_cap` for every user-listed
+  ticker, so the cap weighting kicks in automatically as soon as those
+  symbols are added; sectors built from constituents that haven't been
+  fetched still aggregate uniformly.
 
 ## Test posture
 
@@ -156,7 +169,7 @@ Every external HTTP call goes through `FinnhubGateway` (Finnhub) or an
 injectable `history_fn` (yfinance), both mocked in tests — **no test
 makes a real network call**. SQLite-backed tests run against `:memory:`
 per-test, giving fast and isolated coverage. As of the latest commit:
-**337 tests passing at 95% line+branch coverage** across the
+**381 tests passing at 96% line+branch coverage** across the
 `finn_predictor` package.
 
 See `progress.md` for the design doc, `diff.md` for the per-commit

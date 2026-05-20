@@ -26,6 +26,10 @@ from finn_predictor.predictor.aggregate import (
     daily_sentiment_index,
     rolling_baseline,
 )
+from finn_predictor.predictor.classifier import (
+    LogisticCalibration,
+    apply_logreg_classification,
+)
 from finn_predictor.sentiment.base import Scorer
 from finn_predictor.storage.models import Prediction
 from finn_predictor.storage.repo import save_prediction, utc_day_window
@@ -60,6 +64,7 @@ def predict_market(
     min_baseline_sigma: Optional[float] = None,
     half_life_hours: Optional[float] = None,
     source_weights: Optional[dict[str, float]] = None,
+    calibration: Optional[LogisticCalibration] = None,
 ) -> Optional[Prediction]:
     """Compute and persist a whole-market prediction for ``on_date``.
 
@@ -111,6 +116,13 @@ def predict_market(
 
     if today.count < MIN_ARTICLES_FOR_CALL:
         label, confidence = "FLAT", 0.0
+    elif calibration is not None:
+        # The logistic-regression mode lets the calibration produce a
+        # calibrated probability gap (|2P − 1|) in place of normalised
+        # z-distance. The FLAT band keeps the three-way label slot.
+        label, confidence = apply_logreg_classification(
+            today.weighted_mean, calibration
+        )
     else:
         label, confidence = classify(z, threshold=threshold)
 

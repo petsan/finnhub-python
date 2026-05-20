@@ -21,8 +21,12 @@ from sqlalchemy.orm import Session
 
 from finn_predictor.ingestion.client import FinnhubGateway, IngestionError
 from finn_predictor.ingestion.news import ingest_company_news, ingest_general_news
-from finn_predictor.ingestion.prices import ingest_price_history
+from finn_predictor.ingestion.prices import ingest_market_caps, ingest_price_history
 from finn_predictor.learning.config import active_weights
+from finn_predictor.predictor.classifier import (
+    load_calibration,
+    resolve_classifier_mode,
+)
 from finn_predictor.predictor.market import predict_market
 from finn_predictor.predictor.sectors import predict_all_sectors
 from finn_predictor.predictor.stocks import predict_all_stocks
@@ -83,6 +87,7 @@ def run_daily_ingest(
         "market_prices": 0,
         "sector_prices": 0,
         "company_prices": 0,
+        "company_caps": 0,
         "scored": 0,
         "predictions": 0,
     }
@@ -129,6 +134,16 @@ def run_daily_ingest(
                 session, gateway, symbol=sym, start=yesterday, end=today
             ),
         )
+        # Market caps populate the cap-weighting lookup used by
+        # `predict_sector`. A 403 here (often the case on free tier)
+        # is non-fatal — sectors silently fall back to uniform
+        # weighting for any ticker missing a cap row.
+        counts["company_caps"] = int(counts["company_caps"]) + _try(
+            f"company_caps:{symbol}",
+            lambda sym=symbol: ingest_market_caps(
+                session, gateway, symbol=sym, start=yesterday, end=today
+            ),
+        )
 
     # Scoring + predictions are DB-only operations — they always run, even if
     # every Finnhub fetch above failed, because there may be older articles
@@ -148,6 +163,15 @@ def run_daily_ingest(
         half_life_hours=weights.half_life_hours,
         source_weights=weights.source_weights,
     )
+
+    # When FINN_PREDICTOR_CLASSIFIER=logreg and a calibration has been
+    # fitted (via the `fit-classifier` CLI subcommand), pass it through
+    # so the final classify step swaps z-distance for calibrated
+    # probability. Falls back to the rule classifier on missing data.
+    calibration = None
+    if resolve_classifier_mode() == "logreg":
+        calibration = load_calibration(session)
+    learned_kwargs["calibration"] = calibration
 
     market_pred = predict_market(
         session, scorer=scorer, on_date=today, symbol=market_symbol,

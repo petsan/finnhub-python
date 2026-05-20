@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 
 DEFAULT_DB_URL = "sqlite:///finn_predictor.db"
+DEFAULT_SCORER = "vader"
+SUPPORTED_SCORERS = ("vader", "finbert")
 
 
 @dataclass(frozen=True)
@@ -25,12 +27,17 @@ class Settings:
         request_timeout: HTTP timeout in seconds for Finnhub calls.
         rate_limit_per_minute: Soft cap on calls per minute (Finnhub free tier
             is ~60/min; we leave headroom).
+        scorer_name: Which :class:`Scorer` implementation to use for live
+            scoring. ``vader`` (default) needs no extra dependencies;
+            ``finbert`` requires ``torch`` + ``transformers`` and downloads
+            the ``ProsusAI/finbert`` weights on first use.
     """
 
     finnhub_api_key: str
     database_url: str = DEFAULT_DB_URL
     request_timeout: float = 15.0
     rate_limit_per_minute: int = 55
+    scorer_name: str = DEFAULT_SCORER
 
 
 def load_settings(
@@ -61,9 +68,17 @@ def load_settings(
             "finn-predictor (e.g. `export FINNHUB_API_KEY=...`)."
         )
 
+    scorer_name = source.get("FINN_PREDICTOR_SCORER", DEFAULT_SCORER).strip().lower()
+    if scorer_name not in SUPPORTED_SCORERS:
+        raise RuntimeError(
+            f"FINN_PREDICTOR_SCORER={scorer_name!r} is not supported. "
+            f"Choose one of: {', '.join(SUPPORTED_SCORERS)}."
+        )
+
     return Settings(
         finnhub_api_key=api_key,
         database_url=source.get("FINN_PREDICTOR_DB_URL", DEFAULT_DB_URL),
         request_timeout=float(source.get("FINN_PREDICTOR_TIMEOUT", "15")),
         rate_limit_per_minute=int(source.get("FINN_PREDICTOR_RATE_LIMIT", "55")),
+        scorer_name=scorer_name,
     )

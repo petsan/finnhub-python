@@ -55,3 +55,24 @@ def test_load_settings_optional_key_returns_empty_string() -> None:
 def test_load_settings_optional_still_returns_explicit_key() -> None:
     s = load_settings({"FINNHUB_API_KEY": "abc"}, require_api_key=False)
     assert s.finnhub_api_key == "abc"
+
+
+def test_load_settings_defaults_scorer_to_vader() -> None:
+    s = load_settings({"FINNHUB_API_KEY": "k"})
+    assert s.scorer_name == "vader"
+
+
+def test_load_settings_honours_scorer_env() -> None:
+    s = load_settings(
+        {"FINNHUB_API_KEY": "k", "FINN_PREDICTOR_SCORER": "FinBERT"}
+    )
+    # Case-insensitive, lower-cased on the way in so downstream
+    # callers can match on a single canonical spelling.
+    assert s.scorer_name == "finbert"
+
+
+def test_load_settings_rejects_unknown_scorer() -> None:
+    with pytest.raises(RuntimeError, match="FINN_PREDICTOR_SCORER"):
+        load_settings(
+            {"FINNHUB_API_KEY": "k", "FINN_PREDICTOR_SCORER": "magic-llm"}
+        )

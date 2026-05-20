@@ -264,7 +264,11 @@ rows get an "Activate v\<n\>" button so you can revert at any time.
   under-weighted. The architecture supports swapping in FinBERT under
   the same `Scorer` interface, but the FinBERT path is gated on
   installing `torch` + `transformers` (kept out of the default
-  dependency tree).
+  dependency tree). To activate it: `pip install torch transformers`
+  then set `FINN_PREDICTOR_SCORER=finbert` before launching the UI or
+  the `ingest` CLI. The training loop picks up the new
+  `model_version` automatically — retrain once to fit weights against
+  the new scorer.
 * **Calls are sentiment-only.** The model ignores price action, the
   earnings calendar, macro releases, and microstructure.
 * **Backtest accuracy is the model's, not yours.** No friction

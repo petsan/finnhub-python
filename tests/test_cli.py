@@ -119,6 +119,148 @@ def test_ingest_subcommand_requires_api_key(capsys, tmp_path, monkeypatch) -> No
     assert "FINNHUB_API_KEY" in err
 
 
+def test_ingest_subcommand_happy_path(capsys, tmp_path, monkeypatch) -> None:
+    """`cli ingest` with a key prints JSON counts and returns 0.
+
+    The Finnhub client is real but the network is mocked via
+    ``run_daily_ingest`` so this stays hermetic.
+    """
+    monkeypatch.setenv("FINNHUB_API_KEY", "stub-key")
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db")
+
+    fake_counts: dict[str, object] = {
+        "general_news": 3,
+        "company_news": 0,
+        "market_prices": 5,
+        "sector_prices": 0,
+        "company_prices": 0,
+        "scored": 3,
+        "predictions": 1,
+        "failures": [],
+    }
+
+    with patch(
+        "finn_predictor.ingestion.jobs.run_daily_ingest",
+        return_value=fake_counts,
+    ) as ingest_mock:
+        rc = main(["ingest"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert json.loads(out) == fake_counts
+    # And the lazy import + dispatch actually reached run_daily_ingest.
+    assert ingest_mock.call_count == 1
+    call_kwargs = ingest_mock.call_args.kwargs
+    assert {"session", "gateway", "scorer"} <= set(call_kwargs)
+
+
+def test_hash_password_reads_from_stdin(capsys, monkeypatch) -> None:
+    """Without an argument, hash-password prompts via getpass.getpass."""
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "hunter2-2026")
+    rc = main(["hash-password"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out.strip().startswith("$2")
+
+
+def test_hash_password_stdin_cancelled(capsys, monkeypatch) -> None:
+    """Ctrl-C / EOF at the prompt exits 2 with a cancelled message."""
+    def _raise_eof(prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("getpass.getpass", _raise_eof)
+    rc = main(["hash-password"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "cancelled" in err.lower()
+
+
+def test_hash_password_rejects_too_long(capsys) -> None:
+    """A password longer than MAX_PASSWORD_LEN is rejected via the ValueError branch."""
+    too_long = "a" * 300
+    rc = main(["hash-password", too_long])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "at most" in err.lower()
+
+
+def test_retrain_subcommand_honours_activate_yes(capsys, tmp_path, monkeypatch) -> None:
+    """--activate yes is parsed and threaded into train_weights even when it fails."""
+    monkeypatch.setenv("FINNHUB_API_KEY", "stub")
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db")
+    rc = main(["retrain", "--n-calls", "1", "--activate", "yes"])
+    # Empty DB → NotEnoughDataError → rc=3. The branch we care about
+    # (activate=="yes" → activate_arg=True) is exercised before the raise.
+    assert rc == 3
+    assert "not enough" in capsys.readouterr().err.lower()
+
+
+def test_retrain_subcommand_honours_activate_no(capsys, tmp_path, monkeypatch) -> None:
+    """--activate no is parsed and threaded into train_weights even when it fails."""
+    monkeypatch.setenv("FINNHUB_API_KEY", "stub")
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db")
+    rc = main(["retrain", "--n-calls", "1", "--activate", "no"])
+    assert rc == 3
+
+
+def test_fit_classifier_subcommand_needs_data(capsys, tmp_path, monkeypatch) -> None:
+    """Empty DB → rc=3 + 'need at least' message."""
+    monkeypatch.setenv("FINNHUB_API_KEY", "stub")
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db")
+    rc = main(["fit-classifier"])
+    err = capsys.readouterr().err
+    assert rc == 3
+    assert "need at least" in err.lower()
+
+
+def test_fit_classifier_subcommand_success(tmp_path, monkeypatch, capsys) -> None:
+    """With a seeded dataset, fit-classifier prints calibration JSON and rc=0."""
+    db_url = f"sqlite:///{tmp_path}/f.db"
+    monkeypatch.setenv("FINNHUB_API_KEY", "stub")
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", db_url)
+
+    from finn_predictor.sentiment.vader import VaderScorer
+    from finn_predictor.storage import create_engine_and_session, init_db
+    from finn_predictor.storage.models import Prediction, PredictionOutcome
+    from finn_predictor.storage.repo import save_outcome, save_prediction
+
+    mv = VaderScorer().model_version
+    engine, SL = create_engine_and_session(db_url)
+    init_db(engine)
+    base = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    with SL() as s:
+        for i in range(20):
+            sentiment = 0.5 if i < 10 else -0.5
+            realised = 0.01 if i < 10 else -0.01
+            p = save_prediction(
+                s,
+                Prediction(
+                    target_symbol="^GSPC",
+                    prediction_date=base + timedelta(days=i),
+                    label="UP" if sentiment > 0 else "DOWN",
+                    confidence=0.5,
+                    sentiment_index=sentiment,
+                    article_count=5,
+                    model_version=mv,
+                ),
+            )
+            save_outcome(
+                s,
+                PredictionOutcome(
+                    prediction_id=p.id, realised_return=realised, hit=True
+                ),
+            )
+    engine.dispose()
+
+    rc = main(["fit-classifier"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["beta"] > 0
+    assert payload["n_samples"] == 20
+    assert payload["model_version"] == mv
+
+
 def test_unknown_subcommand_returns_2(capsys, tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("FINNHUB_API_KEY", "stub")
     monkeypatch.setenv("FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db")

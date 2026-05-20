@@ -39,7 +39,7 @@ from finn_predictor.learning.simulate import (
     build_training_frame,
     simulate,
 )
-from finn_predictor.sentiment.vader import VaderScorer
+from finn_predictor.sentiment import resolve_active_scorer
 from finn_predictor.storage.models import LearnedWeight
 from finn_predictor.storage.repo import (
     POLICY_AUTO,
@@ -262,7 +262,10 @@ def train_weights(
     Raises :class:`NotEnoughDataError` when fewer than
     :data:`MIN_TRADES_FOR_TRAINING` closed predictions exist.
     """
-    model_version = model_version or VaderScorer().model_version
+    # Default to whichever scorer the live pipeline is configured for, so
+    # the training set sees the same model_version rows the predictor
+    # writes. VaderScorer is the fallback path when env is unset.
+    model_version = model_version or resolve_active_scorer().model_version
     frame = build_training_frame(session, model_version=model_version)
     total = len(frame.closed_prediction_keys)
     if total < MIN_TRADES_FOR_TRAINING:

@@ -20,6 +20,10 @@ from finn_predictor.predictor.aggregate import (
     aggregate_sentiment,
     rolling_baseline,
 )
+from finn_predictor.predictor.classifier import (
+    LogisticCalibration,
+    apply_logreg_classification,
+)
 from finn_predictor.predictor.market import (
     MIN_ARTICLES_FOR_CALL,
     MIN_BASELINE_SIGMA,
@@ -37,6 +41,7 @@ from finn_predictor.storage.models import (
 from finn_predictor.storage.repo import (
     all_sectors,
     articles_in_window,
+    latest_market_caps,
     related_entities_for,
     save_prediction,
     utc_day_window,
@@ -94,12 +99,21 @@ def predict_sector(
     min_baseline_sigma: Optional[float] = None,
     half_life_hours: Optional[float] = None,
     source_weights: Optional[dict[str, float]] = None,
+    use_market_cap_weights: bool = True,
+    calibration: Optional[LogisticCalibration] = None,
 ) -> Optional[Prediction]:
     """Compute and persist a prediction for one sector's ETF on ``on_date``.
 
     Accepts the same learnable knobs as :func:`predict_market` — both
     predictors pull them from
     :func:`finn_predictor.learning.active_weights` in the daily ingest.
+
+    When ``use_market_cap_weights`` is True (the default) and the DB has
+    cached :class:`HistoricalMarketCap` rows for any of ``sector_symbols``,
+    each article's per-ticker weight is multiplied by its company's most
+    recent market cap as of ``on_date``. Tickers without a cap row keep
+    weight 1.0, so the run silently degrades to the previous uniform
+    behaviour for sectors where caps haven't been ingested yet.
     """
     on_date = on_date or datetime.now(timezone.utc)
     threshold = threshold_sigma if threshold_sigma is not None else THRESHOLD_SIGMA
@@ -107,6 +121,7 @@ def predict_sector(
     half_life = half_life_hours if half_life_hours is not None else 12.0
     sw = source_weights or {}
 
+    sector_symbols = list(sector_symbols)
     paired = _sector_scored_articles(
         session,
         sector_symbols=sector_symbols,
@@ -117,11 +132,28 @@ def predict_sector(
     if n == 0:
         return None
 
+    # Cap weighting is opt-in by argument, but driven by DB state: if the
+    # caller asks for it but no caps are cached, every ticker falls back
+    # to 1.0 and the run is indistinguishable from uniform. Normalising
+    # by the mean keeps the weighted_mean in the same numeric range as
+    # the cap-less path, which matters because the rolling baseline
+    # below does NOT see cap weights (sentiment scores stay in [-1, 1]).
+    caps: dict[str, float] = {}
+    if use_market_cap_weights:
+        caps = latest_market_caps(
+            session, sector_symbols, on_or_before=on_date
+        )
+        if caps:
+            mean_cap = sum(caps.values()) / len(caps)
+            if mean_cap > 0:
+                caps = {k: v / mean_cap for k, v in caps.items()}
+
     _, end = utc_day_window(on_date)
     scores = [s for _, s in paired]
     weights = [
         _recency_weight(a.published_at, end, half_life)
         * sw.get((a.source or "").strip(), 1.0)
+        * caps.get((a.symbol or "").strip(), 1.0)
         for a, _ in paired
     ]
     today_summary = aggregate_sentiment(scores, weights=weights)
@@ -139,6 +171,10 @@ def predict_sector(
 
     if n < MIN_ARTICLES_FOR_CALL:
         label, confidence = "FLAT", 0.0
+    elif calibration is not None:
+        label, confidence = apply_logreg_classification(
+            today_summary.weighted_mean, calibration
+        )
     else:
         label, confidence = classify(z, threshold=threshold)
 
@@ -186,6 +222,8 @@ def predict_all_sectors(
     min_baseline_sigma: Optional[float] = None,
     half_life_hours: Optional[float] = None,
     source_weights: Optional[dict[str, float]] = None,
+    use_market_cap_weights: bool = True,
+    calibration: Optional[LogisticCalibration] = None,
 ) -> list[Prediction]:
     """Run :func:`predict_sector` for every persisted sector.
 
@@ -216,6 +254,8 @@ def predict_all_sectors(
             min_baseline_sigma=min_baseline_sigma,
             half_life_hours=half_life_hours,
             source_weights=source_weights,
+            use_market_cap_weights=use_market_cap_weights,
+            calibration=calibration,
         )
         if pred is not None:
             out.append(pred)

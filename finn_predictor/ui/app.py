@@ -98,7 +98,7 @@ from finn_predictor.predictor.trades import (
     rolling_hit_rate,
     trades_dataframe,
 )
-from finn_predictor.sentiment.vader import VaderScorer
+from finn_predictor.sentiment import resolve_active_scorer
 from finn_predictor.storage import create_engine_and_session, init_db
 from finn_predictor.storage.models import (
     NewsArticle,
@@ -642,7 +642,7 @@ def run_ingestion_with_key(
             counts = run_daily_ingest(
                 session=session,
                 gateway=gateway,
-                scorer=VaderScorer(),
+                scorer=resolve_active_scorer(),
                 company_symbols=list(company_symbols),
             )
         except IngestionError:
@@ -903,7 +903,7 @@ def run_backfill_with_key(
             client=client,
             rate_limiter=RateLimiter(rate_limit_per_minute),
         )
-        scorer = VaderScorer()
+        scorer = resolve_active_scorer()
         try:
             results = backfill_many(
                 session,
@@ -1525,7 +1525,10 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                 horizontal=True,
                 key="focus_mode",
             )
-            vader_version = VaderScorer().model_version
+            # Use whichever scorer the live pipeline is configured for —
+            # falls back to VADER when FINN_PREDICTOR_SCORER is unset, so
+            # the Focus tab keeps working unchanged for the default deploy.
+            vader_version = resolve_active_scorer().model_version
 
             if mode == "Company":
                 tickers_known = sorted(

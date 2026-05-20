@@ -11,6 +11,13 @@ from finn_predictor.predictor.aggregate import (
     daily_sentiment_index,
     rolling_baseline,
 )
+from finn_predictor.predictor.classifier import (
+    LogisticCalibration,
+    NotEnoughCalibrationDataError,
+    apply_logreg_classification,
+    fit_logreg_calibration,
+    resolve_classifier_mode,
+)
 from finn_predictor.predictor.explain import (
     ArticleContribution,
     article_contributions,
@@ -52,6 +59,8 @@ __all__ = [
     "ArticleContribution",
     "CompanyFocus",
     "EventFocus",
+    "LogisticCalibration",
+    "NotEnoughCalibrationDataError",
     "PerformanceSummary",
     "RefreshResult",
     "RelatedPrediction",
@@ -59,6 +68,7 @@ __all__ = [
     "SentimentSummary",
     "TradeRecord",
     "aggregate_sentiment",
+    "apply_logreg_classification",
     "article_contributions",
     "compose_company_focus",
     "compose_event_focus",
@@ -69,6 +79,7 @@ __all__ = [
     "cumulative_pnl_series",
     "daily_sentiment_index",
     "explain_prediction",
+    "fit_logreg_calibration",
     "hit_rate_by_label",
     "hit_rate_by_target_kind",
     "hypothetical_trades",
@@ -78,6 +89,7 @@ __all__ = [
     "predict_market",
     "predict_sector",
     "predict_stock",
+    "resolve_classifier_mode",
     "retroactive_predict_many",
     "retroactive_predict_stock",
     "rolling_baseline",

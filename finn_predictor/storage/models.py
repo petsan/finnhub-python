@@ -130,6 +130,37 @@ class PriceBar(Base):
     volume: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
 
+class HistoricalMarketCap(Base):
+    """A snapshot of a ticker's market capitalisation on a given date.
+
+    Sourced from Finnhub's ``/stock/historical-market-cap`` endpoint and
+    used to cap-weight sector-level sentiment aggregates (a tech-sector
+    headline about Apple should outweigh one about a $500M small-cap by
+    several orders of magnitude). We persist the raw value Finnhub
+    returns (millions of USD) — downstream code normalises rather than
+    relies on the absolute unit so currency / scale changes don't break
+    the predictor.
+    """
+
+    __tablename__ = "historical_market_caps"
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol", "as_of_date", name="uq_historical_market_caps_symbol_date"
+        ),
+        Index("ix_historical_market_caps_symbol_date", "symbol", "as_of_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False)
+    as_of_date: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    market_cap: Mapped[float] = mapped_column(Float, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
 class Prediction(Base):
     """A directional forecast for a target symbol on a given date."""
 

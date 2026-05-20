@@ -175,6 +175,17 @@ class FinnhubGateway:
     ) -> dict[str, Any]:
         return self._call(self.client.stock_candles, symbol, resolution, _from, to)
 
+    def historical_market_cap(
+        self, symbol: str, _from: str, to: str
+    ) -> dict[str, Any]:
+        """Daily market-cap snapshots for ``symbol`` in ``[_from, to]``.
+
+        Finnhub's date params here are ISO ``YYYY-MM-DD`` strings (unlike
+        ``stock_candles``, which is epoch seconds) — callers should pass
+        strings, not datetimes. Used to cap-weight per-sector sentiment.
+        """
+        return self._call(self.client.historical_market_cap, symbol, _from, to)
+
     # --- Relationships -----------------------------------------------------
 
     def company_peers(self, symbol: str) -> list[str]:

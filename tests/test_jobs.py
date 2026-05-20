@@ -177,6 +177,46 @@ def test_run_daily_ingest_processes_company_symbols(session) -> None:
     assert len(predictions_for(session, "AAPL")) == 1
 
 
+def test_run_daily_ingest_persists_company_market_caps(session) -> None:
+    """Per-company ingest now also pulls historical_market_cap.
+
+    Confirms (a) counts["company_caps"] surfaces the row count and
+    (b) a cap-only 403 is isolated to its own failure entry without
+    blocking the rest of the per-ticker pipeline.
+    """
+    iso = D.date().isoformat()
+    gw = MagicMock()
+    gw.general_news.return_value = []
+    gw.company_news.return_value = []  # no news this run, keeps counts minimal
+    gw.stock_candles.return_value = {"s": "no_data"}
+
+    def _caps(symbol, _from, to):
+        if symbol == "AAPL":
+            return {
+                "symbol": "AAPL",
+                "data": [{"atDate": iso, "marketCapitalization": 3_000_000.0}],
+            }
+        raise IngestionError("FinnhubAPI 403: caps gated on free tier")
+
+    gw.historical_market_cap.side_effect = _caps
+
+    counts = run_daily_ingest(
+        session=session,
+        gateway=gw,
+        scorer=VaderScorer(),
+        company_symbols=["AAPL", "GATED"],
+        today=D,
+    )
+    assert counts["company_caps"] == 1
+    cap_failures = [f for f in counts["failures"] if f["op"].startswith("company_caps:")]
+    assert len(cap_failures) == 1
+    assert "GATED" in cap_failures[0]["op"]
+
+    # The persisted cap is visible via the repo helper.
+    from finn_predictor.storage.repo import latest_market_caps
+    assert latest_market_caps(session, ["AAPL"]) == {"AAPL": 3_000_000.0}
+
+
 def test_build_scheduler_registers_job() -> None:
     called: list[int] = []
 

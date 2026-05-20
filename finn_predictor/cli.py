@@ -87,6 +87,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    fit = sub.add_parser(
+        "fit-classifier",
+        help=(
+            "Fit the logistic-regression calibration on closed predictions "
+            "and persist it. Active once FINN_PREDICTOR_CLASSIFIER=logreg."
+        ),
+    )
+    fit.add_argument(
+        "--target-symbol", default=None,
+        help=(
+            "Restrict the training set to one target symbol "
+            "(e.g. '^GSPC' or 'AAPL'). Default fits across all."
+        ),
+    )
+
     return p
 
 
@@ -195,7 +210,7 @@ def cmd_ingest() -> int:
     from finn_predictor.config import load_settings
     from finn_predictor.ingestion.client import FinnhubGateway, RateLimiter
     from finn_predictor.ingestion.jobs import run_daily_ingest
-    from finn_predictor.sentiment.vader import VaderScorer
+    from finn_predictor.sentiment import get_scorer
     from finnhub import Client as FinnhubClient
 
     try:
@@ -215,6 +230,22 @@ def cmd_ingest() -> int:
     except AttributeError:  # pragma: no cover
         pass
 
+    # FINN_PREDICTOR_SCORER picks the live scorer (default 'vader').
+    # FinBERT pulls torch/transformers lazily — surface a friendly
+    # message if it's not installed rather than a raw ImportError.
+    try:
+        scorer = get_scorer(settings.scorer_name)
+    except ImportError as exc:  # pragma: no cover - depends on optional dep
+        print(
+            f"ingest: scorer {settings.scorer_name!r} requested but its "
+            f"dependencies aren't installed ({exc}). Install with "
+            f"`pip install torch transformers` or unset "
+            f"FINN_PREDICTOR_SCORER.",
+            file=sys.stderr,
+        )
+        client.close()
+        return 2
+
     try:
         gateway = FinnhubGateway(
             client=client,
@@ -224,12 +255,57 @@ def cmd_ingest() -> int:
             counts = run_daily_ingest(
                 session=session,
                 gateway=gateway,
-                scorer=VaderScorer(),
+                scorer=scorer,
             )
     finally:
         client.close()
 
     print(json.dumps(counts, indent=2, default=str))
+    return 0
+
+
+def cmd_fit_classifier(*, target_symbol: str | None) -> int:
+    """Fit + persist the logreg calibration. Returns shell exit code."""
+    from finn_predictor.predictor.classifier import (
+        NotEnoughCalibrationDataError,
+        fit_logreg_calibration,
+        save_calibration,
+    )
+    from finn_predictor.sentiment import resolve_active_scorer
+
+    url = _resolve_db_url()
+    engine, SessionLocal = create_engine_and_session(url)
+    init_db(engine)
+
+    # The training set is filtered by the active scorer's model_version
+    # so predictions written by VADER and FinBERT don't get mixed.
+    model_version = resolve_active_scorer().model_version
+
+    with SessionLocal() as session:
+        try:
+            calibration = fit_logreg_calibration(
+                session,
+                model_version=model_version,
+                target_symbol=target_symbol,
+            )
+        except NotEnoughCalibrationDataError as exc:
+            print(f"fit-classifier: {exc}", file=sys.stderr)
+            return 3
+        save_calibration(session, calibration)
+
+    print(
+        json.dumps(
+            {
+                "beta": calibration.beta,
+                "intercept": calibration.intercept,
+                "n_samples": calibration.n_samples,
+                "model_version": model_version,
+                "target_symbol": target_symbol,
+            },
+            indent=2,
+            default=str,
+        )
+    )
     return 0
 
 
@@ -269,6 +345,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_hash_password(args.password)
     if cmd == "ingest":
         return cmd_ingest()
+    if cmd == "fit-classifier":
+        return cmd_fit_classifier(target_symbol=args.target_symbol)
     parser.print_help(sys.stderr)
     return 2
 
