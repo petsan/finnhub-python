@@ -1166,3 +1166,72 @@ next-step buckets:
    what's been built.
 
 Operator picks the next direction.
+
+---
+
+### Session 2026-05-21 (post-merge) — PR #1 merged + local clone synced
+
+**PR merge**
+- Operator merged `petsan/finnhub-python#1` at `2026-05-21T15:25:36Z`
+  via the GitHub UI (merge-commit strategy, not squash). Merge
+  commit: `e1d56e44a5` on `petsan/master`.
+- The PR carried the entire Finn-Predictor history (35 commits)
+  including this session's `f37ea4c` "feature wave: watchlists,
+  affinity tracking, …" — the last 9-126-line commit that closed
+  out PR-1 → PR-8.
+- Base: `petsan/finnhub-python:master` (the fork's main branch).
+  **Not** to the upstream `Finnhub-Stock-API/finnhub-python:master`
+  — that's a separate decision (and probably needs a paring-down
+  pass first, since Finnhub maintainers may not want the whole
+  application living in their client repo).
+
+**Local clone sync**
+
+After the merge:
+
+1. Fast-forwarded local `master` from `c94e7d4` (the upstream
+   release-2.4.28 tip we'd been tracking) all the way to `e1d56e4`
+   (post-merge state). 105 files changed, 31 937 insertions in a
+   single fast-forward — that's the entire Finn-Predictor branch
+   landing on `master` at once. Verified no merge conflicts and no
+   divergence from upstream (`origin/master` was 0 commits ahead).
+2. Deleted local `finn-predictor` branch (`git branch -d`; the
+   merged state is now reachable from `master`).
+3. **Switched local `master`'s upstream tracking** from
+   `origin/master` (the upstream Finnhub-Stock-API repo) to
+   `petsan/master` (the fork). Now `git pull` / `git push` default
+   to the fork; upstream pulls become explicit
+   (`git fetch origin && git merge origin/master`). Mirrors the
+   workflow the operator was already doing manually.
+
+**Where things stand**
+- Working tree clean.
+- `master` ↔ `petsan/master` in sync; 0 commits ahead/behind
+  (`git status -sb` → `## master...petsan/master`).
+- `origin/master` (upstream Finnhub) is 36 commits behind the fork
+  — expected; that's the entire fork's worth of work.
+
+**Documented follow-ups (unchanged from previous entry, still open)**
+1. **PR-8 follow-up** — wire `gp_minimize` over `AFFINITY_WEIGHT`
+   inside a blended objective in `learning/simulate.py`.
+2. **Themes-in-Prediction-table** — widen
+   `Prediction.target_symbol` from `String(16)` to `String(64)` so
+   themes can write to the table (one-line model change + one
+   Postgres `ALTER COLUMN` migration).
+3. **UI surfacing for PR-4..PR-8** — Themes tab, Affinity-blend
+   sidebar toggle, per-stock affinity-breakdown popover,
+   Competitors + Institutional-holders sections on the Focus tab.
+4. **Security-roadmap items from `security.md`** — F-01 / F-02
+   (Caddy + security headers), F-04 (auth-gate rate limit + audit
+   log), F-05 (pin Docker base by digest), F-06 (`pip-audit` in
+   CI), F-07 (Proxmox installer secret hardening), F-08 second
+   half (per-session ingest throttle).
+
+**Heads-up surfaced during push**
+- GitHub reported a moderate Dependabot vulnerability on
+  `petsan/finnhub-python:master`:
+  `https://github.com/petsan/finnhub-python/security/dependabot/1`.
+  Not blocking; not a finding introduced by this session. Worth
+  inspecting alongside F-06 (`pip-audit` in CI).
+
+**No code changes this turn** — pure repository-state housekeeping.

@@ -1,8 +1,10 @@
 # Finn-Predictor — Summary
 
 A sentiment-driven, crude market & per-stock direction predictor built on top of
-the upstream `finnhub-python` client. Built interactively on the `finn-predictor`
-branch; left the upstream library untouched.
+the upstream `finnhub-python` client. Originally developed on the
+`finn-predictor` branch and **merged to `petsan/master` on 2026-05-21**
+(PR #1, merge commit `e1d56e4`); upstream `Finnhub-Stock-API/finnhub-python`
+remains untouched.
 
 ## What it does
 

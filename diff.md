@@ -12,6 +12,11 @@ Totals across the branch: **101 files changed, ~26,400 insertions(+),
 the previous 88-file total; see the PR-1 → PR-8 entries below for
 the per-PR breakdown.
 
+**Status (2026-05-21):** the branch was merged into `petsan/master`
+as PR #1 (merge commit `e1d56e4`). All subsequent commits land
+directly on `master`. The `finn-predictor` branch has been
+deleted locally — its history is preserved through the merge.
+
 ---
 
 ## c4864df — Add finn-predictor: sentiment-driven market & sector forecaster
@@ -1428,6 +1433,37 @@ the new dimensions inside a blended objective in
 `learning/simulate.py`. The persistence + read machinery shipped here
 is the foundation; the optimiser loop becomes a small extension once
 the blended objective is in place.
+
+---
+
+## e1d56e4 — Merge pull request #1 from petsan/finn-predictor
+
+*Merge commit on `petsan/master`, 2026-05-21T15:25:36Z.*
+
+The full Finn-Predictor history (35 commits, c4864df → f37ea4c)
+landed on `petsan/master` via the GitHub UI merge-commit strategy
+(not squash — the per-commit history is preserved for archaeology).
+Base: `petsan/finnhub-python:master`. **Not** merged to the upstream
+`Finnhub-Stock-API/finnhub-python` — that would require a separate
+paring-down pass (upstream maintainers may not want the whole
+application living in the client repo).
+
+Post-merge local sync:
+
+* Fast-forwarded local `master` from `c94e7d4` (release 2.4.28 tip)
+  to `e1d56e4`. 105 files / 31 937 insertions in one ff — no
+  conflicts. Local `finn-predictor` branch deleted.
+* Switched local `master`'s upstream from `origin/master` (upstream
+  Finnhub-Stock-API) to `petsan/master` (this fork) so `git pull` /
+  `git push` default to the fork.
+
+GitHub flagged one moderate Dependabot vulnerability on
+`petsan/master` at push time (alert #1). Not introduced by this
+session; worth inspecting alongside F-06 (`pip-audit` in CI).
+
+No application code changed beyond what was already in the merged
+PR; this entry exists to record the merge itself + the local clone
+state transition.
 
 ---
 
