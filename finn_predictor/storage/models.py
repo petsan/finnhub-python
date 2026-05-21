@@ -262,9 +262,26 @@ class LearnedWeight(Base):
 class RelatedEntity(Base):
     """Cached relationship from a ticker to another entity.
 
-    ``relationship`` ∈ {PEER, SUPPLIER, CUSTOMER, ETF_HOLDING}.
-    ``related_symbol`` is a ticker for everything except where Finnhub
-    returns a non-listed entity (then it's the human name).
+    ``relationship`` ∈ {PEER, SUPPLIER, CUSTOMER, ETF_HOLDING, COMPETITOR,
+    INSTITUTIONAL_HOLDER, THEME_MEMBER}. The repo-layer
+    :data:`finn_predictor.storage.repo.RELATIONSHIPS` set is the
+    source of truth; this docstring is informational. ``related_symbol``
+    is a ticker for everything except where Finnhub returns a non-listed
+    entity (then it's the human name or institutional identifier).
+
+    Affinity additions (PR-4..PR-6):
+
+    * **COMPETITOR** — a peer that shares Finnhub's ``finnhubIndustry``
+      with the target, or one the operator promoted explicitly. Distinct
+      from PEER so curation doesn't destroy the underlying peer list.
+    * **INSTITUTIONAL_HOLDER** — a 13-F filer holding the target stock;
+      ``related_symbol`` is the institution name or CIK, ``rank`` is
+      the ownership percentage * 100 (so it sorts cleanly).
+    * **THEME_MEMBER** — a ticker that's a member of an
+      :class:`InvestmentTheme`; here ``source_symbol`` is the theme
+      code (not a ticker) and ``related_symbol`` is the constituent
+      ticker. Intentional inversion of the usual direction so the
+      cached query "members of theme X" is one index hit.
     """
 
     __tablename__ = "related_entities"
@@ -287,6 +304,108 @@ class RelatedEntity(Base):
     fetched_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
+
+
+class Watchlist(Base):
+    """A named collection of tickers the operator wants tracked.
+
+    Replaces the legacy comma-separated sidebar textbox as the source
+    of truth for which symbols ``predict_all_stocks`` / backfills / the
+    Today tab should operate on. Multiple lists can coexist (e.g.
+    "Tech bets", "Energy short list") and a single symbol can belong
+    to many lists at once — the join lives in :class:`WatchlistMember`.
+
+    Names are case-preserving but case-insensitively unique (we enforce
+    via a normalised key in repo helpers, not at the DB layer, to keep
+    SQLite portability). ``created_at`` and ``updated_at`` are stamped
+    on the application side via repo helpers — same convention as
+    :class:`AppSetting`.
+    """
+
+    __tablename__ = "watchlists"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    members: Mapped[list["WatchlistMember"]] = relationship(
+        back_populates="watchlist",
+        cascade="all, delete-orphan",
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug only
+        return f"Watchlist(name={self.name!r})"
+
+
+class WatchlistMember(Base):
+    """A (watchlist, symbol) edge.
+
+    ``(watchlist_id, symbol)`` is unique — a symbol may belong to multiple
+    lists but only once per list. ``notes`` is optional free-form text the
+    operator can attach (e.g. "core position", "earnings 2026-Q2"). The
+    foreign key uses ``ondelete=CASCADE`` so removing a Watchlist cleans
+    up its members in one statement.
+    """
+
+    __tablename__ = "watchlist_members"
+    __table_args__ = (
+        UniqueConstraint("watchlist_id", "symbol", name="uq_watchlist_members"),
+        Index("ix_watchlist_members_watchlist", "watchlist_id"),
+        Index("ix_watchlist_members_symbol", "symbol"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    watchlist_id: Mapped[int] = mapped_column(
+        ForeignKey("watchlists.id", ondelete="CASCADE"), nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    watchlist: Mapped[Watchlist] = relationship(back_populates="members")
+
+
+class InvestmentTheme(Base):
+    """A curated or operator-added investment theme.
+
+    Mirrors :class:`Sector` semantically — a named collection of
+    tickers — but the membership comes from Finnhub's
+    ``/stock/investment-theme`` endpoint rather than the SPDR sector
+    classification. The actual ticker → theme edges live in
+    :class:`RelatedEntity` with ``relationship = "THEME_MEMBER"`` and
+    ``source_symbol = theme_code`` (note: inverted direction; the
+    theme is the source, the ticker is the target — this makes
+    "constituents of theme X" a single indexed lookup).
+
+    ``theme_code`` is Finnhub's identifier (camelCase, e.g.
+    ``cyberSecurity``, ``financialExchangesData``). ``name`` is the
+    operator-friendly label shown in the UI; defaults to a Title-Case
+    rendering of the code but the operator can override it via the
+    CLI's ``add-theme --name`` flag.
+    """
+
+    __tablename__ = "investment_themes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    theme_code: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug only
+        return f"InvestmentTheme(code={self.theme_code!r}, name={self.name!r})"
 
 
 class PredictionOutcome(Base):

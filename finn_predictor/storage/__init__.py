@@ -4,6 +4,7 @@ from finn_predictor.storage.engine import create_engine_and_session, init_db
 from finn_predictor.storage.models import (
     AppSetting,
     Base,
+    InvestmentTheme,
     LearnedWeight,
     NewsArticle,
     PriceBar,
@@ -12,6 +13,8 @@ from finn_predictor.storage.models import (
     RelatedEntity,
     Sector,
     SentimentScore,
+    Watchlist,
+    WatchlistMember,
 )
 from finn_predictor.storage.clustering import (
     Clusterer,
@@ -36,6 +39,7 @@ __all__ = [
     "AppSetting",
     "Base",
     "Clusterer",
+    "InvestmentTheme",
     "EmbeddingClusterer",
     "LearnedWeight",
     "NewsArticle",
@@ -47,6 +51,8 @@ __all__ = [
     "SECTOR_MEMBERSHIP",
     "Sector",
     "SentimentScore",
+    "Watchlist",
+    "WatchlistMember",
     "WELL_KNOWN_NAMES",
     "create_engine_and_session",
     "earliest_story_times",

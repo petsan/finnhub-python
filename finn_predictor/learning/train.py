@@ -26,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from finn_predictor.learning.config import (
+    DIM_AFFINITY_WEIGHT,
     DIM_HALF_LIFE,
     DIM_MIN_SIGMA,
     DIM_SOURCE_WEIGHT,
@@ -188,6 +189,29 @@ def _activate_version(session: Session, version: int) -> None:
     activate_learned_version(session, version)
 
 
+def _curated_affinity_baseline() -> dict[str, float]:
+    """Default per-relationship weights persisted alongside the legacy dims.
+
+    Pulled from :class:`predictor.blended.AffinityWeights` so the
+    curated PR-7 defaults become the v1 baseline; future training
+    iterations can refit them against closed outcomes (PR-8 follow-up
+    will wire ``gp_minimize`` over these dimensions once
+    :mod:`learning.simulate` supports a blended objective).
+    """
+    from finn_predictor.predictor.blended import AffinityWeights
+
+    w = AffinityWeights()
+    return {
+        "SELF": w.self_weight,
+        "PEER": w.peer,
+        "COMPETITOR": w.competitor,
+        "SUPPLIER": w.supplier,
+        "CUSTOMER": w.customer,
+        "THEME_MEMBER": w.theme_member,
+        "INSTITUTIONAL_HOLDER": w.institutional_holder,
+    }
+
+
 def _persist_weights(
     session: Session,
     *,
@@ -198,8 +222,15 @@ def _persist_weights(
     source_weights: dict[str, float],
     training_score: float,
     holdout_score: Optional[float],
+    affinity_weights: Optional[dict[str, float]] = None,
 ) -> None:
-    """Write one row per dimension. Caller decides whether to activate."""
+    """Write one row per dimension. Caller decides whether to activate.
+
+    ``affinity_weights`` (PR-8) defaults to the curated baseline from
+    :func:`_curated_affinity_baseline` when None — i.e. fresh training
+    runs persist the curated defaults so the predictor's blended path
+    has a versioned baseline to read against.
+    """
     rows = [
         LearnedWeight(
             version=version, dimension=DIM_THRESHOLD, key=None,
@@ -224,6 +255,16 @@ def _persist_weights(
         rows.append(
             LearnedWeight(
                 version=version, dimension=DIM_SOURCE_WEIGHT, key=src,
+                value=float(w),
+                training_score=training_score, holdout_score=holdout_score,
+                is_active=False,
+            )
+        )
+    affinity = affinity_weights if affinity_weights else _curated_affinity_baseline()
+    for rel, w in affinity.items():
+        rows.append(
+            LearnedWeight(
+                version=version, dimension=DIM_AFFINITY_WEIGHT, key=rel,
                 value=float(w),
                 training_score=training_score, holdout_score=holdout_score,
                 is_active=False,

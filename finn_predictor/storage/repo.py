@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional, Sequence
 
@@ -21,6 +22,8 @@ from finn_predictor.storage.models import (
     RelatedEntity,
     Sector,
     SentimentScore,
+    Watchlist,
+    WatchlistMember,
 )
 
 
@@ -423,7 +426,34 @@ def all_sectors(session: Session) -> Sequence[Sector]:
 # The fixed vocabulary for RelatedEntity.relationship. Anything else
 # is a programming error.
 RELATIONSHIPS = frozenset(
-    {"PEER", "SUPPLIER", "CUSTOMER", "ETF_HOLDING"}
+    {
+        "PEER",
+        "SUPPLIER",
+        "CUSTOMER",
+        "ETF_HOLDING",
+        # Affinity additions (PR-4..PR-6):
+        # COMPETITOR — auto-seeded from PEER rows that share Finnhub's
+        #   ``finnhubIndustry`` with the target. Distinct from PEER so
+        #   the operator can curate which peers are *really* competitors
+        #   without losing the underlying peer list. Both rows can
+        #   coexist for the same (source, related) pair — the unique
+        #   constraint is on the (source, related, relationship) triple.
+        "COMPETITOR",
+        # INSTITUTIONAL_HOLDER — 13-F filers holding the target stock.
+        # ``related_symbol`` is the institution name (uppercased, truncated
+        # to fit the 64-char column); ``rank`` is the position in Finnhub's
+        # response (0 = biggest holder by share count); ``metadata_text``
+        # carries the JSON-encoded ownership %, share count, and filing
+        # date so callers can sort by % without re-parsing.
+        "INSTITUTIONAL_HOLDER",
+        # THEME_MEMBER — a ticker that's a member of an
+        # :class:`InvestmentTheme`. ``source_symbol`` is the theme code
+        # (NOT a ticker — intentional inversion so the "members of theme
+        # X" query is one index hit); ``related_symbol`` is the
+        # constituent ticker. ``rank`` is the position in Finnhub's
+        # response (no semantic meaning beyond response order today).
+        "THEME_MEMBER",
+    }
 )
 
 
@@ -496,6 +526,439 @@ def related_entities_for(
         key=lambda r: (r.rank is None, r.rank if r.rank is not None else 0, r.related_symbol)
     )
     return rows
+
+
+# -- Streak / flipped analytics for the per-stock table -------------------
+
+
+@dataclass(frozen=True)
+class StreakInfo:
+    """Current-label streak + previous label for a target symbol.
+
+    A ``streak`` of N means the latest N consecutive predictions for
+    ``symbol`` carry the same ``current_label``. ``previous_label`` is
+    the label of the prediction immediately before the streak started
+    (i.e. the first row, scanning back from latest, whose label differs
+    from ``current_label``); ``None`` when ``symbol`` has only ever
+    carried one label. ``flipped`` is True iff
+    ``previous_label is not None and previous_label != current_label``
+    — which is always the same as ``previous_label is not None``, but
+    the explicit field is cheaper to read at the call site.
+
+    "Yesterday's label" semantics: we use the predictions' own ordering
+    by ``prediction_date desc``, not literal "yesterday." When ingestion
+    misses a day or the operator backfills only weekdays, the previous
+    label is the next-most-recent row, not the calendar predecessor.
+    Documented here so the UI caption matches.
+    """
+
+    symbol: str
+    current_label: str
+    streak: int                   # ≥ 1 whenever the symbol is present in the dict
+    previous_label: Optional[str] = None
+    flipped: bool = False
+
+
+def streaks_for(
+    session: Session,
+    symbols: Iterable[str],
+    *,
+    model_version: Optional[str] = None,
+) -> dict[str, StreakInfo]:
+    """Compute current-label streak + flipped-vs-previous in one SQL pass.
+
+    Returns ``{symbol: StreakInfo}`` only for symbols that have at
+    least one prediction row; symbols with no history are omitted (so
+    a caller can use ``streaks.get(symbol)`` and fall back cleanly).
+
+    ``model_version`` (optional) filters predictions to a single model
+    so a mixed live VADER + back-fitted logreg history doesn't conflate
+    streaks across model boundaries. The UI passes the active model's
+    version when it has one.
+
+    The query is selective on ``target_symbol`` (indexed) and orders by
+    ``(target_symbol, prediction_date desc)`` so we can walk the rows
+    in a single pass, grouped by symbol, and compute everything in
+    Python — no recursive CTE, no per-symbol round-trip.
+    """
+    symbol_set = {s for s in symbols if s}
+    if not symbol_set:
+        return {}
+
+    stmt = (
+        select(
+            Prediction.target_symbol,
+            Prediction.label,
+            Prediction.prediction_date,
+        )
+        .where(Prediction.target_symbol.in_(symbol_set))
+        .order_by(Prediction.target_symbol, Prediction.prediction_date.desc())
+    )
+    if model_version is not None:
+        stmt = stmt.where(Prediction.model_version == model_version)
+
+    grouped: dict[str, list[str]] = {}
+    for sym, label, _dt in session.execute(stmt):
+        grouped.setdefault(sym, []).append(label)
+
+    out: dict[str, StreakInfo] = {}
+    for sym, labels in grouped.items():
+        # ``grouped`` is built via ``setdefault(...).append(label)`` so
+        # every value list is guaranteed non-empty — no defensive
+        # ``if not labels`` branch needed.
+        current_label = labels[0]
+        streak = 0
+        previous_label: Optional[str] = None
+        for label in labels:
+            if previous_label is None and label == current_label:
+                streak += 1
+                continue
+            # First disagreement marks the end of the streak; record
+            # the prior label and stop scanning. Anything older isn't
+            # useful for the "flipped today vs yesterday" caption.
+            previous_label = label
+            break
+        out[sym] = StreakInfo(
+            symbol=sym,
+            current_label=current_label,
+            streak=streak,
+            previous_label=previous_label,
+            flipped=previous_label is not None,
+        )
+    return out
+
+
+# -- Watchlists -----------------------------------------------------------
+
+# Watchlist name shape: keep human-friendly but pinned down enough that
+# the UI dropdown / URL slugging works. Allowed: letters, digits, space,
+# underscore, hyphen, dot. 1–64 chars (matches the DB column).
+import re as _re
+
+_WATCHLIST_NAME_RE = _re.compile(r"[A-Za-z0-9 _.\-]{1,64}")
+
+
+class WatchlistError(ValueError):
+    """Raised on bad watchlist input (name shape, missing list, etc.).
+
+    A ValueError subclass so callers can catch either type. Carrying its
+    own class lets the UI distinguish "the operator made a typo" from
+    "unrelated ValueError" without grovelling through the message.
+    """
+
+
+def _normalise_watchlist_name(name: str) -> str:
+    """Strip surrounding whitespace and reject the empty / malformed case.
+
+    Returns the cleaned name. Raises :class:`WatchlistError` for empty,
+    too-long, or charset-violating inputs. Case is preserved — two
+    lists ``Tech`` and ``tech`` are considered the same by the DB's
+    case-sensitive UNIQUE index, but we don't normalise to one case
+    so the operator sees what they typed.
+    """
+    if not isinstance(name, str):
+        raise WatchlistError("watchlist name must be a string")
+    cleaned = name.strip()
+    if not cleaned:
+        raise WatchlistError("watchlist name must be non-empty")
+    if _WATCHLIST_NAME_RE.fullmatch(cleaned) is None:
+        raise WatchlistError(
+            f"watchlist name {name!r} contains invalid characters; "
+            "allowed: letters, digits, space, underscore, hyphen, dot"
+        )
+    return cleaned
+
+
+def _validate_watchlist_symbol(symbol: str) -> str:
+    """Uppercase + shape-check a symbol via the ingestion-layer validator.
+
+    Centralises the per-ticker validation so a Watchlist member can
+    never be created with a symbol that the rest of the pipeline would
+    reject downstream. Imported lazily to avoid a top-level dependency
+    cycle (``ingestion`` already imports ``storage``).
+    """
+    from finn_predictor.ingestion.symbols import valid_ticker
+
+    if not isinstance(symbol, str):
+        raise WatchlistError("symbol must be a string")
+    cleaned = symbol.strip().upper()
+    if not valid_ticker(cleaned):
+        raise WatchlistError(f"symbol {symbol!r} is not a valid ticker")
+    return cleaned
+
+
+def create_watchlist(
+    session: Session,
+    *,
+    name: str,
+    description: Optional[str] = None,
+) -> Watchlist:
+    """Insert a new watchlist.
+
+    Raises :class:`WatchlistError` if the name is malformed or a list
+    with the same name already exists. Returns the persisted instance
+    so the caller can read ``id`` / ``created_at`` without re-querying.
+    """
+    cleaned = _normalise_watchlist_name(name)
+    if session.scalar(select(Watchlist).where(Watchlist.name == cleaned)):
+        raise WatchlistError(f"watchlist {cleaned!r} already exists")
+
+    now = _utcnow()
+    row = Watchlist(
+        name=cleaned,
+        description=(description.strip() if description else None) or None,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(row)
+    session.commit()
+    return row
+
+
+def get_watchlist(session: Session, name: str) -> Optional[Watchlist]:
+    """Return the watchlist with ``name``, or None if missing.
+
+    Lenient on input: strips outer whitespace but raises on a malformed
+    name (so callers can't paper over typos by getting None back).
+    """
+    cleaned = _normalise_watchlist_name(name)
+    return session.scalar(select(Watchlist).where(Watchlist.name == cleaned))
+
+
+def list_watchlists(session: Session) -> list[Watchlist]:
+    """All watchlists, ordered by name."""
+    return list(session.scalars(select(Watchlist).order_by(Watchlist.name)))
+
+
+def rename_watchlist(
+    session: Session, *, old_name: str, new_name: str
+) -> Watchlist:
+    """Rename an existing watchlist.
+
+    Raises if ``old_name`` is missing or ``new_name`` collides with an
+    existing list. No-op (returns the existing row) when ``old_name``
+    and ``new_name`` resolve to the same string after normalisation.
+    """
+    old_clean = _normalise_watchlist_name(old_name)
+    new_clean = _normalise_watchlist_name(new_name)
+
+    existing = session.scalar(select(Watchlist).where(Watchlist.name == old_clean))
+    if existing is None:
+        raise WatchlistError(f"watchlist {old_clean!r} not found")
+
+    if new_clean == old_clean:
+        return existing
+
+    clash = session.scalar(select(Watchlist).where(Watchlist.name == new_clean))
+    if clash is not None:
+        raise WatchlistError(f"watchlist {new_clean!r} already exists")
+
+    existing.name = new_clean
+    existing.updated_at = _utcnow()
+    session.commit()
+    return existing
+
+
+def update_watchlist_description(
+    session: Session, *, name: str, description: Optional[str]
+) -> Watchlist:
+    """Replace the description (or clear it with ``None`` / empty string)."""
+    cleaned = _normalise_watchlist_name(name)
+    existing = session.scalar(select(Watchlist).where(Watchlist.name == cleaned))
+    if existing is None:
+        raise WatchlistError(f"watchlist {cleaned!r} not found")
+    new_desc = (description.strip() if description else None) or None
+    existing.description = new_desc
+    existing.updated_at = _utcnow()
+    session.commit()
+    return existing
+
+
+def delete_watchlist(session: Session, *, name: str) -> bool:
+    """Delete a watchlist and all its members (cascade).
+
+    Returns True when a row was deleted, False when no such list
+    existed — lets the UI's "Delete <name>" button be idempotent
+    without raising on a double-click.
+    """
+    cleaned = _normalise_watchlist_name(name)
+    existing = session.scalar(select(Watchlist).where(Watchlist.name == cleaned))
+    if existing is None:
+        return False
+    session.delete(existing)
+    session.commit()
+    return True
+
+
+def add_to_watchlist(
+    session: Session,
+    *,
+    name: str,
+    symbol: str,
+    notes: Optional[str] = None,
+) -> WatchlistMember:
+    """Add ``symbol`` to ``name``. Idempotent — re-adding refreshes notes.
+
+    The symbol passes through :func:`_validate_watchlist_symbol` so
+    nothing the upstream Finnhub client would reject can land in the
+    DB. Re-adding an existing (list, symbol) pair updates only
+    ``notes`` and bumps the parent list's ``updated_at`` — useful when
+    the operator annotates an existing pick.
+    """
+    cleaned_name = _normalise_watchlist_name(name)
+    cleaned_symbol = _validate_watchlist_symbol(symbol)
+
+    parent = session.scalar(select(Watchlist).where(Watchlist.name == cleaned_name))
+    if parent is None:
+        raise WatchlistError(f"watchlist {cleaned_name!r} not found")
+
+    existing = session.scalar(
+        select(WatchlistMember).where(
+            WatchlistMember.watchlist_id == parent.id,
+            WatchlistMember.symbol == cleaned_symbol,
+        )
+    )
+    cleaned_notes = (notes.strip() if notes else None) or None
+    now = _utcnow()
+    if existing is not None:
+        existing.notes = cleaned_notes
+        parent.updated_at = now
+        session.commit()
+        return existing
+
+    row = WatchlistMember(
+        watchlist_id=parent.id,
+        symbol=cleaned_symbol,
+        notes=cleaned_notes,
+        added_at=now,
+    )
+    session.add(row)
+    parent.updated_at = now
+    session.commit()
+    return row
+
+
+def remove_from_watchlist(
+    session: Session, *, name: str, symbol: str
+) -> bool:
+    """Remove ``symbol`` from ``name``. Returns True iff a row was removed."""
+    cleaned_name = _normalise_watchlist_name(name)
+    cleaned_symbol = _validate_watchlist_symbol(symbol)
+
+    parent = session.scalar(select(Watchlist).where(Watchlist.name == cleaned_name))
+    if parent is None:
+        raise WatchlistError(f"watchlist {cleaned_name!r} not found")
+
+    member = session.scalar(
+        select(WatchlistMember).where(
+            WatchlistMember.watchlist_id == parent.id,
+            WatchlistMember.symbol == cleaned_symbol,
+        )
+    )
+    if member is None:
+        return False
+    session.delete(member)
+    parent.updated_at = _utcnow()
+    session.commit()
+    return True
+
+
+def watchlist_members(session: Session, *, name: str) -> list[WatchlistMember]:
+    """All members of ``name``, ordered by symbol."""
+    cleaned = _normalise_watchlist_name(name)
+    parent = session.scalar(select(Watchlist).where(Watchlist.name == cleaned))
+    if parent is None:
+        raise WatchlistError(f"watchlist {cleaned!r} not found")
+    return list(
+        session.scalars(
+            select(WatchlistMember)
+            .where(WatchlistMember.watchlist_id == parent.id)
+            .order_by(WatchlistMember.symbol)
+        )
+    )
+
+
+def watchlist_symbols(
+    session: Session, *, name: Optional[str] = None
+) -> list[str]:
+    """Symbols belonging to one or all watchlists.
+
+    When ``name`` is None, returns the deduped union across every
+    watchlist, sorted alphabetically — the natural default for
+    "ingest everything I've ever bookmarked." When ``name`` is set,
+    returns just that list's symbols in sort order. Missing list
+    raises :class:`WatchlistError` so the caller doesn't silently
+    treat a typo as an empty universe.
+    """
+    if name is None:
+        rows = session.scalars(select(WatchlistMember.symbol).distinct())
+        return sorted({s for s in rows})
+
+    cleaned = _normalise_watchlist_name(name)
+    parent = session.scalar(select(Watchlist).where(Watchlist.name == cleaned))
+    if parent is None:
+        raise WatchlistError(f"watchlist {cleaned!r} not found")
+    rows = session.scalars(
+        select(WatchlistMember.symbol).where(WatchlistMember.watchlist_id == parent.id)
+    )
+    return sorted({s for s in rows})
+
+
+def replace_watchlist_symbols(
+    session: Session, *, name: str, symbols: Iterable[str]
+) -> int:
+    """Atomically replace ``name``'s members with ``symbols``.
+
+    Designed for the sidebar's "paste tickers + save" flow — the UI
+    parses the textbox, validates via :mod:`finn_predictor.ingestion.symbols`,
+    then hands the result to this helper which wipes the old set and
+    inserts the new one in a single transaction. Returns the number of
+    symbols in the resulting list.
+
+    Each symbol is re-validated here so a caller that bypassed the UI
+    parser still can't corrupt the table.
+    """
+    cleaned_name = _normalise_watchlist_name(name)
+    parent = session.scalar(select(Watchlist).where(Watchlist.name == cleaned_name))
+    if parent is None:
+        raise WatchlistError(f"watchlist {cleaned_name!r} not found")
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols:
+        sym = _validate_watchlist_symbol(raw)
+        if sym in seen:
+            continue
+        seen.add(sym)
+        cleaned.append(sym)
+
+    now = _utcnow()
+    # Drop the old set first. We have to ``flush`` between the deletes
+    # and the new inserts: SQLAlchemy's unit-of-work otherwise batches
+    # INSERTs ahead of DELETEs on the same table, which trips the
+    # ``(watchlist_id, symbol)`` UNIQUE constraint when the same symbol
+    # appears in both the old and the new set.
+    existing_rows = list(
+        session.scalars(
+            select(WatchlistMember).where(WatchlistMember.watchlist_id == parent.id)
+        )
+    )
+    for row in existing_rows:
+        session.delete(row)
+    session.flush()
+
+    for sym in cleaned:
+        session.add(
+            WatchlistMember(
+                watchlist_id=parent.id,
+                symbol=sym,
+                notes=None,
+                added_at=now,
+            )
+        )
+    parent.updated_at = now
+    session.commit()
+    return len(cleaned)
 
 
 # -- App settings (cross-session UI preferences) ---------------------------

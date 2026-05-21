@@ -108,7 +108,12 @@ from finn_predictor.storage.models import (
     Sector,
     SentimentScore,
 )
-from finn_predictor.storage.repo import all_sectors, predictions_for, price_bars
+from finn_predictor.storage.repo import (
+    all_sectors,
+    predictions_for,
+    price_bars,
+    streaks_for,
+)
 from finn_predictor.storage.clustering import resolve_active_clusterer
 from finn_predictor.storage.stories import earliest_story_times  # noqa: F401  (kept for tests / external imports)
 from finn_predictor.storage.symbol_names import expand_symbol, expand_symbol_short
@@ -452,30 +457,94 @@ def group_stock_predictions_by_sector(
     return grouped, unmapped
 
 
+# Column list pinned out so the empty-frame and CSV-export paths share
+# the same schema (and so a smoke test can assert it cheaply).
+_STOCK_TABLE_COLUMNS: tuple[str, ...] = (
+    "Company",
+    "Ticker",
+    "Call",
+    "Confidence",
+    "Streak",
+    "Flipped",
+    "Articles",
+    "Sentiment",
+    "Band",
+    "As of",
+)
+
+
 def stock_predictions_table(
-    session: Session, stock_preds: Iterable[Prediction]
+    session: Session,
+    stock_preds: Iterable[Prediction],
+    *,
+    streaks: dict | None = None,
 ) -> pd.DataFrame:
-    """DataFrame of per-stock predictions sorted by descending confidence."""
+    """DataFrame of per-stock predictions, sorted by descending confidence.
+
+    Columns (PR-3):
+        Company · Ticker · Call · Confidence · **Streak** · **Flipped** ·
+        Articles · Sentiment · **Band** · As of
+
+    * ``Streak`` (int, ≥1) — consecutive days at the current label,
+      via :func:`finn_predictor.storage.repo.streaks_for`. 1 means
+      the call is brand new (first day at this label or first
+      prediction ever).
+    * ``Flipped`` (bool) — True iff the previous prediction carried a
+      different label. False on day-1 calls (no prior history).
+    * ``Band`` (str | None) — magnitude band rendered as
+      ``-1.2% to +1.5%`` when calibration is fit; otherwise blank.
+      Falls back to the existing :func:`format_expected_move`.
+
+    ``streaks`` (optional) lets tests inject a pre-computed mapping;
+    when None the function queries the DB itself. The injection path
+    keeps the table builder testable without a session round-trip
+    when the caller already has the data.
+    """
+    preds = list(stock_preds)
+    if streaks is None and preds:
+        # One DB pass per render of the per-stock table — cheap; the
+        # query is indexed on (target_symbol).
+        streaks = streaks_for(session, [p.target_symbol for p in preds])
+    streaks = streaks or {}
+
     rows = []
-    for p in stock_preds:
+    for p in preds:
+        info = streaks.get(p.target_symbol)
+        band = format_expected_move(p)
         rows.append(
             {
                 "Company": expand_symbol_short(session, p.target_symbol),
                 "Ticker": p.target_symbol,
                 "Call": p.label,
                 "Confidence": round(p.confidence, 2),
+                # Default streak to 1 for brand-new predictions whose
+                # streaks_for lookup hasn't run yet (defensive — shouldn't
+                # happen, but the table should never render an empty cell).
+                "Streak": int(info.streak) if info is not None else 1,
+                "Flipped": bool(info.flipped) if info is not None else False,
                 "Articles": p.article_count,
                 "Sentiment": round(p.sentiment_index, 3),
+                "Band": band if band is not None else "",
                 "As of": p.prediction_date,
             }
         )
     if not rows:
-        return pd.DataFrame(
-            columns=["Company", "Ticker", "Call", "Confidence", "Articles", "Sentiment", "As of"]
-        )
+        return pd.DataFrame(columns=list(_STOCK_TABLE_COLUMNS))
     df = pd.DataFrame(rows)
     # Sort by absolute confidence descending so the strongest calls float up.
     return df.sort_values(["Confidence", "Articles"], ascending=False).reset_index(drop=True)
+
+
+def predictions_csv_bytes(df: pd.DataFrame) -> bytes:
+    """UTF-8 CSV bytes for ``st.download_button``. Pure helper.
+
+    Empty input → bytes of just the header row (so the operator still
+    gets a valid CSV they can paste a section into later). Non-string
+    cells use pandas' default rendering — booleans become ``True``/``False``,
+    datetimes round-trip as ISO. The ``Band`` column is already a
+    pre-formatted string so it survives unchanged.
+    """
+    return df.to_csv(index=False).encode("utf-8")
 
 
 def headlines_from_contributions(
@@ -1241,10 +1310,29 @@ class _SidebarState:
     backfill_lookback_days: int
     price_backfill_triggered: bool
     price_backfill_days: int
+    # Active watchlist name, or None when the operator is using the
+    # free-form textbox. Lets ``main()`` route ingestion + UI through
+    # ``_resolve_active_tickers`` rather than parsing ``symbols_csv``
+    # directly. Added in PR-2.
+    active_watchlist: str | None = None
 
 
-def _render_sidebar() -> _SidebarState:  # pragma: no cover - Streamlit UI
-    """Render the API-key + ingestion + backfill sidebar."""
+# Streamlit session_state key for the company-tickers text input. Pulled
+# out as a constant so the watchlist-load handler can repopulate it
+# before the widget renders.
+TICKER_INPUT_KEY = "company_tickers_input"
+ACTIVE_WATCHLIST_KEY = "_active_watchlist_selection"
+LAST_LOADED_WATCHLIST_KEY = "_last_loaded_watchlist"
+
+
+def _render_sidebar(SessionLocal=None) -> _SidebarState:  # pragma: no cover - Streamlit UI
+    """Render the API-key + ingestion + backfill sidebar.
+
+    ``SessionLocal`` (optional) is the SQLAlchemy ``sessionmaker``
+    bound to the live engine. Passed in so the watchlist expander can
+    read + write its tables; the rest of the sidebar still functions
+    without it (legacy "no watchlists" mode).
+    """
     # Hydrate the key from browser localStorage on the first render
     # of this session. Must run BEFORE the text_input below, because
     # the input's value comes from st.session_state[API_KEY_SESSION_KEY].
@@ -1276,11 +1364,35 @@ def _render_sidebar() -> _SidebarState:  # pragma: no cover - Streamlit UI
         else:
             st.warning("no key set — ingestion disabled")
 
+        # --- Watchlists -------------------------------------------------
+        # Renders BEFORE the ticker text_input so a "Load" action can
+        # mutate ``st.session_state[TICKER_INPUT_KEY]`` ahead of the
+        # input's first paint this rerun.
+        active_watchlist = _render_watchlist_expander(SessionLocal)
+
         symbols_csv = st.text_input(
             "Company tickers (optional, comma-separated)",
             value="",
             placeholder="AAPL, MSFT, NVDA",
+            key=TICKER_INPUT_KEY,
+            help=(
+                "Free-form ticker list. Select a saved list above to "
+                "load its symbols into this field; edits stay local "
+                "until you Save."
+            ),
         )
+
+        # Surface PR-1 parser feedback (rejected tokens / truncation)
+        # so the operator can see what was dropped and why. Silent
+        # when input is clean.
+        try:
+            from finn_predictor.ingestion.symbols import parse_ticker_list
+            _parser_warning = _format_parser_warning(parse_ticker_list(symbols_csv))
+            if _parser_warning:
+                st.caption(_parser_warning)
+        except Exception:
+            # Parser failure should never break the sidebar.
+            pass
 
         col_clear, col_run = st.columns(2)
         with col_clear:
@@ -1357,12 +1469,235 @@ def _render_sidebar() -> _SidebarState:  # pragma: no cover - Streamlit UI
         backfill_lookback_days=backfill_lookback_days,
         price_backfill_triggered=bool(price_backfill_clicked),
         price_backfill_days=price_backfill_days,
+        active_watchlist=active_watchlist,
     )
 
 
+def _render_watchlist_expander(SessionLocal) -> str | None:  # pragma: no cover - Streamlit UI
+    """Render the *Watchlists* sidebar expander; return the active list name.
+
+    Behaviour:
+        * Dropdown lists every saved watchlist plus a synthetic
+          "— manual textbox —" entry that means "use the free-form
+          input below."
+        * Selecting a saved list populates the ticker text input with
+          its symbols (one-shot per selection change, so the operator
+          can then edit freely).
+        * "Save current input as new list" reads the current textbox,
+          validates via :func:`parse_ticker_list`, and writes a fresh
+          :class:`Watchlist` + :class:`WatchlistMember` set.
+        * "Delete selected" removes the active list (with a Streamlit
+          ``button(type="primary")`` confirm pattern via a second
+          session_state flag).
+
+    Returns the active watchlist name (or None for the manual textbox).
+    When ``SessionLocal`` is None — e.g. transient bootstrap path —
+    the expander is hidden and we return None unconditionally so the
+    legacy textbox-only behaviour applies.
+    """
+    if SessionLocal is None:
+        return None
+
+    from finn_predictor.ingestion.symbols import parse_ticker_list
+    from finn_predictor.storage.repo import (
+        WatchlistError,
+        create_watchlist,
+        delete_watchlist,
+        list_watchlists,
+        replace_watchlist_symbols,
+        watchlist_symbols,
+    )
+
+    with st.expander("Watchlists", expanded=False):
+        with SessionLocal() as session:
+            saved = list_watchlists(session)
+            names = [w.name for w in saved]
+
+        MANUAL_LABEL = "— manual textbox —"
+        options = [MANUAL_LABEL] + names
+
+        # Preserve the prior selection across reruns. Default to manual.
+        prior_selection = st.session_state.get(ACTIVE_WATCHLIST_KEY, MANUAL_LABEL)
+        if prior_selection not in options:
+            # The list was deleted from under us; fall back to manual.
+            prior_selection = MANUAL_LABEL
+        selection = st.selectbox(
+            "Active list",
+            options=options,
+            index=options.index(prior_selection),
+            key=ACTIVE_WATCHLIST_KEY,
+            help=(
+                "Selecting a saved list loads its symbols into the "
+                "ticker input below."
+            ),
+        )
+
+        # When the selection moves to a real watchlist (and wasn't on
+        # that one already this rerun), repopulate the textbox.
+        if selection != MANUAL_LABEL and st.session_state.get(
+            LAST_LOADED_WATCHLIST_KEY
+        ) != selection:
+            try:
+                with SessionLocal() as session:
+                    syms = watchlist_symbols(session, name=selection)
+                st.session_state[TICKER_INPUT_KEY] = ", ".join(syms)
+                st.session_state[LAST_LOADED_WATCHLIST_KEY] = selection
+                st.rerun()
+            except WatchlistError:
+                pass
+
+        # Save current input as a new list.
+        st.caption("Save the current textbox as a named list:")
+        new_name = st.text_input(
+            "New list name",
+            value="",
+            key="_watchlist_new_name",
+            placeholder="e.g. Tech bets",
+            label_visibility="collapsed",
+        )
+        save_clicked = st.button(
+            "Save as new list",
+            disabled=not new_name.strip(),
+            key="_watchlist_save_btn",
+        )
+        if save_clicked:
+            csv = st.session_state.get(TICKER_INPUT_KEY, "")
+            parsed = parse_ticker_list(csv)
+            if not parsed.valid:
+                st.error("Nothing to save — paste at least one valid ticker first.")
+            else:
+                try:
+                    with SessionLocal() as session:
+                        create_watchlist(session, name=new_name)
+                        replace_watchlist_symbols(
+                            session, name=new_name, symbols=parsed.valid
+                        )
+                    st.success(
+                        f"Saved {len(parsed.valid)} ticker(s) to {new_name.strip()!r}."
+                    )
+                    st.session_state[ACTIVE_WATCHLIST_KEY] = new_name.strip()
+                    st.session_state[LAST_LOADED_WATCHLIST_KEY] = None
+                    st.rerun()
+                except WatchlistError as exc:
+                    st.error(f"Couldn't save: {exc}")
+
+        # Delete the active list (if any).
+        if selection != MANUAL_LABEL:
+            delete_clicked = st.button(
+                f"Delete '{selection}'",
+                key="_watchlist_delete_btn",
+                help="Removes the list and its members. Cannot be undone.",
+            )
+            if delete_clicked:
+                with SessionLocal() as session:
+                    delete_watchlist(session, name=selection)
+                st.session_state[ACTIVE_WATCHLIST_KEY] = MANUAL_LABEL
+                st.session_state[LAST_LOADED_WATCHLIST_KEY] = None
+                st.rerun()
+
+    return None if selection == MANUAL_LABEL else selection
+
+
 def _parse_symbols(csv: str) -> list[str]:
-    """Split a comma-separated ticker string. Empty → empty list. Public for tests."""
-    return [s.strip().upper() for s in csv.split(",") if s.strip()]
+    """Split a comma-separated ticker string. Empty → empty list. Public for tests.
+
+    Delegates to :func:`finn_predictor.ingestion.symbols.parse_ticker_list`
+    so shape-validation, deduping, and the count/length caps stay in one
+    place (per security F-08, F-13). The legacy return shape (plain
+    list[str]) is preserved — callers that want the rejected list or
+    the truncation flag should call :func:`parse_ticker_list` directly.
+    """
+    from finn_predictor.ingestion.symbols import parse_ticker_list
+    return parse_ticker_list(csv).valid
+
+
+def _format_parser_warning(result) -> str | None:
+    """Build a one-line caption summarising what the ticker parser dropped.
+
+    Returns None when the input was clean (nothing rejected, nothing
+    truncated) — the caller suppresses the caption entirely in that
+    case. Otherwise returns a short string suitable for ``st.caption``.
+
+    Two distinct surfaces:
+
+    * **Rejected** tokens — listed up to 5, with their reason. Tells
+      the operator "we dropped these because…" so they can fix typos.
+    * **Truncated** — the parser hit :data:`MAX_TICKERS` or
+      :data:`MAX_INPUT_LEN`. Tells the operator we kept only the
+      first N.
+
+    Designed for the sidebar's `Company tickers` input and the
+    Backfill input. Importing :class:`ParseResult` lazily so this
+    module doesn't acquire a hard dep on the ingestion package at
+    import time (already the case for ``parse_ticker_list`` above).
+    """
+    if result is None:
+        return None
+    pieces: list[str] = []
+
+    rejected = list(getattr(result, "rejected", []) or [])
+    if rejected:
+        # Reason → human-friendly noun. Stable order so the UI doesn't
+        # shuffle the caption between reruns.
+        reasons = {
+            "bad_chars": "invalid characters",
+            "too_long": "too long",
+            "duplicate": "duplicate",
+            "empty": "empty",
+        }
+        # Show up to 5 specific tokens so the caption doesn't get huge
+        # when an operator pastes a wall of garbage.
+        shown = rejected[:5]
+        more = len(rejected) - len(shown)
+        bits = ", ".join(
+            f"{tok!r} ({reasons.get(reason, reason)})" for tok, reason in shown
+        )
+        if more > 0:
+            bits = f"{bits} + {more} more"
+        pieces.append(f"⚠ Dropped: {bits}.")
+
+    if getattr(result, "truncated", False):
+        pieces.append(
+            "⚠ Input truncated — only the first batch was kept "
+            "(cap is 50 tickers / 8 KiB)."
+        )
+
+    return " ".join(pieces) if pieces else None
+
+
+def _resolve_active_tickers(
+    session,
+    *,
+    symbols_csv: str,
+    active_watchlist: str | None,
+) -> list[str]:
+    """Decide which tickers to act on given the sidebar's two sources.
+
+    Precedence:
+
+    1. ``active_watchlist`` is set → return that watchlist's symbols.
+       If the list is missing (deleted between renders) we silently
+       fall through to (2) rather than raise — UX over correctness
+       at this layer; the next rerun will refresh the dropdown.
+    2. Otherwise → parse ``symbols_csv`` through the standard
+       :func:`_parse_symbols` validator.
+
+    Pure function modulo the session read. Pulled out of
+    ``_render_sidebar`` (which is ``# pragma: no cover`` Streamlit
+    runtime) so the precedence rules are unit-testable.
+    """
+    if active_watchlist:
+        try:
+            from finn_predictor.storage.repo import (
+                WatchlistError,
+                watchlist_symbols,
+            )
+            return watchlist_symbols(session, name=active_watchlist)
+        except Exception:
+            # Either the list was deleted under us, or the name was
+            # invalid. Both fall through to the textbox path.
+            pass
+    return _parse_symbols(symbols_csv)
 
 
 def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
@@ -1380,7 +1715,7 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
     engine, SessionLocal = create_engine_and_session(settings.database_url)
     init_db(engine)
 
-    sidebar = _render_sidebar()
+    sidebar = _render_sidebar(SessionLocal)
     triggered_key = sidebar.triggered_key
     symbols_csv = sidebar.symbols_csv
 
@@ -1466,7 +1801,14 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                         )
 
         if triggered_key:
-            symbols = _parse_symbols(symbols_csv)
+            # Route through the active-watchlist resolver: when the
+            # operator has a saved list selected, ingest that list's
+            # symbols rather than the textbox. PR-2.
+            symbols = _resolve_active_tickers(
+                session,
+                symbols_csv=symbols_csv,
+                active_watchlist=sidebar.active_watchlist,
+            )
             with st.spinner("Ingesting news & prices…"):
                 try:
                     counts = run_ingestion_with_key(
@@ -1641,6 +1983,14 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                     session, stock_preds
                 )
 
+                # Compute streaks once for the union of tickers — passed
+                # into every per-section table builder + the combined
+                # CSV builder so we don't issue the same query four times.
+                all_streaks = streaks_for(
+                    session,
+                    [p.target_symbol for p in stock_preds],
+                )
+
                 _stock_column_config = {
                     "Confidence": st.column_config.ProgressColumn(
                         "Confidence",
@@ -1653,6 +2003,23 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                         format="%+.3f",
                         help="Recency-weighted mean of today's "
                              "scored articles, on a [-1, +1] scale.",
+                    ),
+                    "Streak": st.column_config.NumberColumn(
+                        "Streak",
+                        format="%d",
+                        help="Consecutive days at the current Call. "
+                             "1 means today is the first day at this "
+                             "label (or the first prediction).",
+                    ),
+                    "Flipped": st.column_config.CheckboxColumn(
+                        "Flipped",
+                        help="True iff yesterday's Call differed from "
+                             "today's. False on day-1 picks.",
+                    ),
+                    "Band": st.column_config.TextColumn(
+                        "Band",
+                        help="Magnitude band (10th–90th pctile, median). "
+                             "Empty until `fit-magnitude` has been run.",
                     ),
                     "As of": st.column_config.DatetimeColumn(
                         "As of",
@@ -1677,7 +2044,9 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                             f"{len(preds_in_sector)} stock(s)"
                         )
                     st.markdown(sector_header)
-                    df = stock_predictions_table(session, preds_in_sector)
+                    df = stock_predictions_table(
+                        session, preds_in_sector, streaks=all_streaks
+                    )
                     st.dataframe(
                         df,
                         use_container_width=True,
@@ -1691,13 +2060,35 @@ def main() -> None:  # pragma: no cover - thin glue exercised by the dev server
                         f"{len(unmapped)} stock(s) not in the curated "
                         "sector map"
                     )
-                    df = stock_predictions_table(session, unmapped)
+                    df = stock_predictions_table(
+                        session, unmapped, streaks=all_streaks
+                    )
                     st.dataframe(
                         df,
                         use_container_width=True,
                         hide_index=True,
                         column_config=_stock_column_config,
                     )
+
+                # --- CSV export of every per-stock prediction ----------
+                # Single combined download, one row per ticker, all
+                # sectors concatenated. Re-uses the same column shape
+                # the dataframes above render with.
+                full_df = stock_predictions_table(
+                    session, stock_preds, streaks=all_streaks
+                )
+                today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                st.download_button(
+                    "⬇ Download per-stock predictions as CSV",
+                    data=predictions_csv_bytes(full_df),
+                    file_name=f"finn-predictor-stocks-{today_iso}.csv",
+                    mime="text/csv",
+                    help=(
+                        "Every per-stock prediction in one CSV — same "
+                        "columns as the tables above, all sectors "
+                        "combined."
+                    ),
+                )
 
             # --- Contribution chart (per-article, divergent bars) ----
             market_contribs: list[ArticleContribution] = []

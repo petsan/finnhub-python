@@ -5,8 +5,12 @@ chronological (oldest → newest) order. The upstream `finnhub-python`
 library itself (`finnhub/`, `setup.py`, etc.) is **untouched**; everything
 new lives under `finn_predictor/`, `tests/`, and a few config files.
 
-Totals across the branch: **88 files changed, ~22,350 insertions(+),
-3 deletions(-)** vs. `master` (commit `c94e7d4 release 2.4.28`).
+Totals across the branch: **101 files changed, ~26,400 insertions(+),
+3 deletions(-)** vs. `master` (commit `c94e7d4 release 2.4.28`). The
+2026-05-21 collaborative session added 13 new source/test files +
+3 new docs (`architecture.md`, `security.md`, `design.md`) on top of
+the previous 88-file total; see the PR-1 → PR-8 entries below for
+the per-PR breakdown.
 
 ---
 
@@ -988,6 +992,464 @@ No application code changed; 472 tests still pass.
 
 ---
 
+## 2026-05-21 — kickoff: codebase summary + security audit + architecture diagram
+
+*3 docs added, no source code changed.*
+
+Operator brief: scan the codebase, produce a software-architecture
+diagram, investigate how to add individual-stock predictions + the
+front-end, design how to track stocks/themes by affinity (competition,
+supplier, controlling interest, etc.), run a security audit, write
+tests for everything, and keep `progress.md` + `summary.md` current.
+
+Discovery findings (no code changes yet):
+
+* Per-stock predictions **already exist** end-to-end
+  (`predictor/stocks.py`, surfaced on the Today tab sector-grouped +
+  sorted by confidence). The brief's "add individual stock ticker
+  symbols" framing is *enhancement*, not greenfield.
+* `RelatedEntity` table already populated with `PEER`, `SUPPLIER`,
+  `CUSTOMER`, `ETF_HOLDING` from Finnhub `company_peers`,
+  `stock_supply_chain`, `etfs_holdings`. Used by the Focus tab + sector
+  synthesis fallback.
+* **Missing** for the brief: `COMPETITOR` (distinct from PEER),
+  `INSTITUTIONAL_HOLDER` (13-F data unused), `THEME` (Finnhub's
+  `stock_investment_theme` unused), persisted user-curated watchlist.
+
+Docs landed:
+
+* **`security.md`** — first-pass security audit. 17 findings F-01..F-17
+  with severity ratings (Critical / High / Medium / Low / Info), threat
+  model (assets, actors, surfaces), hardening roadmap. `pip-audit`
+  could not run in the sandbox (TLS verify blocked) — recorded as F-06.
+* **`architecture.md`** — engineer's reference: module map with LOC
+  per file, dependency-direction diagram, Mermaid diagram, three
+  runtime flows (ingest / UI render / training), data contracts table,
+  failure-mode catalogue, "where new features plug in" matrix.
+* **`design.md`** — gap analysis (per-stock UI G-1..G-8) + affinity
+  schema deltas + 8-PR implementation plan (PR-1 .. PR-8) + four
+  open questions for sign-off.
+
+Baseline test count confirmed: 472 passing in 41.4s. Operator approved
+all four defaults (watchlists in same SQLite; auto-seed COMPETITOR
+from PEER+industry; affinity blend off by default with learner fitting
+weights; 10–15 themes pre-seeded).
+
+---
+
+## PR-1 — symbol-validation helper + UI wiring
+
+*3 files, +377 / −2*
+
+Closes security findings F-08 (input caps on user-supplied tickers)
+and F-13 (symbol-shape validator before user-supplied tickers reach
+the upstream Finnhub URL builder).
+
+**New module** `finn_predictor/ingestion/symbols.py`:
+
+* `valid_ticker(symbol)` — `re.fullmatch` against `[A-Z0-9.^-]{1,16}`.
+  The `fullmatch` is deliberate: Python's `$` anchor matches before a
+  trailing newline by default, so `"AAPL\n"` would have slipped past a
+  naive `re.match(r"^...$")`. The comment in source warns the next
+  reader.
+* `parse_ticker_list(raw, *, max_count=50, max_input_len=8192)`
+  returning a frozen `ParseResult` dataclass with `valid`, `rejected`
+  (per-token reason: `REJECT_EMPTY` / `REJECT_TOO_LONG` /
+  `REJECT_BAD_CHARS` / `REJECT_DUPLICATE`), and `truncated`. Caps
+  the input at 50 tickers and 8 KiB.
+
+**UI wiring**: `_parse_symbols` in `ui/app.py` now delegates to
+`parse_ticker_list().valid` — legacy `list[str]` return shape
+preserved so all existing callsites keep working.
+
+Tests: +45 (new `tests/test_symbols.py`), 100% line+branch coverage on
+the new module. Net: 472 → 517 passing.
+
+---
+
+## PR-2 — Watchlist + WatchlistMember models + sidebar UI
+
+*5 files, +811 / −5*
+
+Persisted, named ticker lists become the canonical source of truth
+(replacing the comma-separated sidebar textbox). Foundation that PR-3
+(streaks) and PR-7 (affinity blending per target list) build on.
+
+**Schema** (new tables, additive — `init_db()`'s `create_all` picks
+them up on next start, no migration needed):
+
+* `Watchlist(id, name unique, description, created_at, updated_at)`.
+* `WatchlistMember(id, watchlist_id FK ON DELETE CASCADE, symbol,
+  notes, added_at)` with `(watchlist_id, symbol)` UNIQUE and indexes
+  for both watchlist-side and symbol-side lookups.
+
+**Repo helpers** in `storage/repo.py`: `create_watchlist`,
+`get_watchlist`, `list_watchlists`, `rename_watchlist`,
+`update_watchlist_description`, `delete_watchlist`, `add_to_watchlist`
+(idempotent — refreshes notes on re-add), `remove_from_watchlist`,
+`watchlist_members`, `watchlist_symbols` (union across all lists when
+name is None), `replace_watchlist_symbols` (atomic — validates every
+symbol before any write). Plus `WatchlistError(ValueError)` and
+shape-checked name / symbol normalisers.
+
+**UI helpers** in `ui/app.py`: `_format_parser_warning(ParseResult)`
+builds the sidebar caption surfacing PR-1's rejected / truncated
+output; `_resolve_active_tickers(session, ...)` decides whether the
+ingestion pipeline acts on a saved list or the textbox content.
+
+**Sidebar widget**: *Watchlists* expander — selectbox of saved lists
++ manual-textbox option, "Save as new list" form, "Delete <name>"
+button. When a list is selected, the ticker text input pre-populates
+with its symbols via `st.session_state`.
+
+Tests: +77 (`tests/test_watchlists.py` 58 + `tests/test_ui_watchlist_helpers.py`
+19). Net: 517 → 594 passing.
+
+**Two SQLAlchemy / SQLite gotchas surfaced** (and documented inline
+for the next reader):
+
+1. SQLAlchemy's unit-of-work batches INSERTs ahead of DELETEs on the
+   same table — `replace_watchlist_symbols` tripped the
+   `(watchlist_id, symbol)` UNIQUE constraint when old and new sets
+   overlapped. Fix: explicit `session.flush()` between the delete loop
+   and the insert loop.
+2. SQLite strips tz from `DateTime(timezone=True)` columns on read-back,
+   so comparing the in-memory tz-aware value against the
+   post-`session.refresh` naive value raises `TypeError`. Tests use a
+   `_to_utc(d)` helper that normalises both sides.
+
+Security: PR-1's `valid_ticker` is now also enforced inside the repo
+write paths — a future CLI / programmatic caller bypassing the UI
+parser still can't corrupt the table.
+
+---
+
+## PR-3 — Streak + Flipped + Band columns + CSV export
+
+*4 files, +468 / −10*
+
+Per-stock table on the Today tab gains three new columns + a
+single-button CSV download.
+
+**New repo helper** in `storage/repo.py`:
+`streaks_for(session, symbols, *, model_version=None) -> dict[str, StreakInfo]`.
+One SQL pass selecting `(target_symbol, label, prediction_date)` for
+the requested symbols, ordered by `(target_symbol, prediction_date
+DESC)`; Python walks the rows once, breaks on first disagreement per
+symbol, emits one `StreakInfo` per symbol with history. Symbols with
+no rows are *omitted* (callers can use `streaks.get(sym)` safely).
+
+**`StreakInfo` frozen dataclass**: `symbol`, `current_label`,
+`streak (≥1)`, `previous_label (Optional[str])`, `flipped (bool)`.
+Documented "yesterday" semantics: it's the prior prediction by date,
+not literally calendar-yesterday.
+
+**`stock_predictions_table` extended** with an optional `streaks=`
+parameter (computed via the DB if absent) + three new columns:
+**Streak** (int, ≥1), **Flipped** (bool), **Band** (pre-formatted
+string from `format_expected_move` or empty).
+
+**`predictions_csv_bytes(df) -> bytes`** new pure helper for the
+`st.download_button` data argument. Empty frame → header-only CSV.
+Round-trips via pandas.
+
+**UI integration**: Today tab computes streaks once per render
+(passed to every per-section table builder + the combined-CSV
+builder), Streamlit `column_config` entries for the new columns
+(NumberColumn / CheckboxColumn / TextColumn), and a
+*⬇ Download per-stock predictions as CSV* button under the
+per-stock area. Filename: `finn-predictor-stocks-<today_iso>.csv`.
+
+Tests: +21 (`tests/test_streaks.py` 16 + 5 in `tests/test_ui_helpers.py`).
+Net: 594 → 615 passing.
+
+**One bug surfaced** (and documented inline): pandas wraps Python
+bools as `numpy.bool_`, so `df.iloc[0]["Flipped"] is False` is always
+False. Switched test assertions to `bool(cell) is False`.
+
+**One dead branch trimmed**: the first cut of `streaks_for` had a
+defensive `if not labels: continue` that turned out to be unreachable
+(`grouped[sym]` only exists when at least one append ran). Removed
+with a comment explaining why.
+
+---
+
+## PR-4 — COMPETITOR relationship + auto-seed + curation
+
+*7 files, +1004 / −15*
+
+**New module** `finn_predictor/predictor/affinity.py` — this PR adds
+the COMPETITOR machinery; PR-5 and PR-6 will extend this module with
+institutional-holder and theme ingest respectively.
+
+* `refresh_competitors(session, gateway, *, symbol)` — walks each
+  PEER row for the target, fetches `company_profile2(peer)`, writes a
+  COMPETITOR row when ``finnhubIndustry`` matches. PEER rows are
+  preserved (curation is additive). Idempotent re-run; per-peer
+  failure isolated; target without industry returns a no-op result
+  with an informational failure entry.
+* `promote_peer_to_competitor(session, *, symbol, peer_symbol)` and
+  `demote_competitor(session, *, symbol, peer_symbol)` for manual
+  curation. Both validate symbols via PR-1's `valid_ticker`.
+* `CompetitorRefreshResult` dataclass with `peers_considered`,
+  `competitors_added`, `skipped_no_industry`, `failures`.
+
+**Schema**: `RELATIONSHIPS` frozenset in `storage/repo.py` extended
+with `COMPETITOR`. `RelatedEntity` model docstring updated to document
+the expanded allowed set (forward-references PR-5 + PR-6 additions
+too).
+
+**Focus tab**: `CompanyFocus` gains `competitors: list[RelatedPrediction]`;
+`compose_company_focus` populates it via
+`related_entities_for(..., relationship="COMPETITOR")`. The article
+universe expansion now includes competitor symbols too so the
+recent-articles list isn't blind to competitor news.
+
+**CLI**: three new subcommands —
+`promote-competitor SYMBOL PEER_SYMBOL`,
+`demote-competitor SYMBOL PEER_SYMBOL` (idempotent — exit 0 with
+`removed=false` when the row didn't exist),
+`refresh-competitors --symbol SYMBOL [--symbol ...]`. The refresh
+subcommand requires `FINNHUB_API_KEY` and exits 2 when missing.
+
+Tests: +34 (`tests/test_affinity_competitors.py` 27 + 7 new in
+`tests/test_cli.py`). Net: 615 → 649 passing.
+
+---
+
+## PR-5 — Institutional holders ingest (13-F)
+
+*4 files, +454 / −1*
+
+**Gateway**: new method `institutional_ownership(symbol, _from, to)`
+in `ingestion/client.py` — passes empty cusip to the upstream client
+(symbol-only lookup; cusip is optional on `/institutional/ownership`).
+
+**Ingest**: `refresh_institutional_holders(session, gateway, *, symbol,
+lookback_days=180, limit=25, today=None)` in `predictor/affinity.py`.
+Resilient to gating (403 captured into `failures`, never raised).
+Pulls top N holders by Finnhub's natural sort order (descending by
+share value); persists one `RelatedEntity(relationship="INSTITUTIONAL_HOLDER")`
+per holder.
+
+Persistence design:
+
+* `related_symbol` is the institution name (uppercased + collapsed
+  whitespace + truncated to fit the 64-char column). The same filer
+  reporting under "Vanguard Group, Inc." one quarter and "VANGUARD
+  GROUP INC" the next collapses to one row.
+* `rank` is the position in Finnhub's response (0 = biggest holder)
+  so `related_entities_for`'s ascending-by-rank sort naturally surfaces
+  the largest holder first.
+* `metadata_text` carries the JSON-encoded ownership %, share count,
+  value, and filing date so the UI can sort/display without re-parsing.
+
+Helpers: `_normalise_institution_name`, `_coerce_float` (Finnhub
+occasionally returns numeric fields as strings),
+`_parse_institutional_payload` (non-dict / missing-data → empty
+defensive path).
+
+**Schema**: `RELATIONSHIPS` extended with `INSTITUTIONAL_HOLDER`.
+`InstitutionalHoldersResult` dataclass with `holders_added`,
+`holders_refreshed`, `failures`.
+
+**Focus tab**: `CompanyFocus.institutional_holders` field populated by
+`compose_company_focus`.
+
+Tests: +18 (new `tests/test_affinity_institutional.py`).
+Net: 649 → 667 passing.
+
+---
+
+## PR-6 — InvestmentTheme + ingest + themes predictor
+
+*7 files, +1185 / −5*
+
+**Design decision recorded**: themes do **not** write to the
+`Prediction` table because theme codes can exceed the 16-char
+`Prediction.target_symbol` limit (`financialExchangesData` is 22
+chars). Instead, `predict_theme` returns a `ThemePrediction` dataclass;
+the UI renders it from a fresh aggregation each pageload. Schema
+widening to `String(64)` is filed as a follow-up.
+
+**New table** `InvestmentTheme(id, theme_code unique, name, description,
+fetched_at)` — mirrors `Sector` semantically.
+
+**New module** `finn_predictor/predictor/themes.py`:
+
+* `DEFAULT_THEME_CODES` — 12 curated Finnhub theme codes
+  (financialExchangesData, cyberSecurity, cleanEnergy, electricVehicles,
+  aiSemis, cloudComputing, robotics, spaceExploration, digitalPayments,
+  nuclearEnergy, semiconductor, futureMobility).
+* `ThemePrediction` frozen dataclass: theme_code, theme_name,
+  constituent_count, label, confidence, sentiment_index, article_count,
+  model_version, prediction_date.
+* `predict_theme(session, *, scorer, theme_code, ...)` — mirror of
+  `predict_sector` but for THEME_MEMBER constituents. Z-score classifier
+  against a rolling baseline of theme indices. Returns None when no
+  members or no scored articles.
+* `predict_all_themes(session, *, scorer, ...)` — iterates registered
+  themes, patches in operator-friendly names from `InvestmentTheme`,
+  sorts by descending confidence. Per-theme failure isolation in the
+  loop.
+
+**Ingest extension** in `predictor/affinity.py`:
+
+* `refresh_investment_themes(session, gateway, *, theme_codes=None)`
+  — defaults to `DEFAULT_THEME_CODES` when no codes supplied. Per-theme
+  failure isolation; idempotent re-run; dedupes within one response.
+* `add_investment_theme` for the operator-curated path (no API call).
+* `_humanise_theme_code` — `cyberSecurity` → `Cyber Security` for display.
+* `_parse_theme_payload` — defensive against non-dict / wrong-shape
+  payloads.
+
+**Direction inversion documented**: THEME_MEMBER rows store
+`source_symbol = theme_code` and `related_symbol = ticker` (opposite
+from peer/supplier rows) so the "constituents of theme X" query is one
+index hit.
+
+**Schema**: `RELATIONSHIPS` extended with `THEME_MEMBER`.
+`Gateway.stock_investment_theme(theme)` added.
+
+**CLI**: `add-theme <code> [--name NAME] [--description DESC]` and
+`refresh-themes [--theme CODE ...]`. Also added `from sqlalchemy import
+select` at module top of `cli.py` (was previously runtime function-local
+elsewhere).
+
+Tests: +31 (new `tests/test_themes.py`). Net: 667 → 698 passing.
+
+**One bug surfaced** (and documented inline): the first cut of
+`predict_theme` called `rolling_baseline(daily_means)` — wrong API
+(that function walks the DB itself and is scoped to one symbol).
+Replaced with `aggregate_sentiment(daily_means)` + manual z-score
+computation with a floor on the denominator so day-1 themes don't pin
+confidence at 1.0.
+
+---
+
+## PR-7 — Affinity-blended per-stock predictor
+
+*2 files, +759 / 0*
+
+The headline feature of the wave. **Off by default per the locked
+decision.**
+
+**New module** `finn_predictor/predictor/blended.py`:
+
+* `AffinityWeights` frozen dataclass with curated defaults — SELF=1.0,
+  PEER=0.10, COMPETITOR=−0.30, SUPPLIER=0.15, CUSTOMER=0.25,
+  THEME_MEMBER=0.10, INSTITUTIONAL_HOLDER=0.0 (no article corpus
+  matches an institution name, but the field exists for PR-8 fitting).
+* `DEFAULT_AFFINITY_WEIGHTS` constant.
+* `predict_stock_blended(session, *, scorer, symbol, on_date,
+  affinity_weights, ...)` — pools SELF + each related entity's
+  same-day scored articles, multiplies each article's contribution by
+  (relationship_weight × recency_weight), classifies the weighted
+  index against the target's own rolling baseline of *blended* indices.
+* `predict_all_stocks_blended` — list iteration with skip-on-blank.
+* `AffinityContribution` dataclass for the per-relationship breakdown
+  (surfaces in the UI popover).
+* `explain_blend` — pure read; computes contributions without
+  persisting. Suitable for popover handlers.
+* `_build_blended_pool` / `_blended_index_for_day` /
+  `_related_symbols` / `_theme_co_members` private helpers.
+
+**Aggregation math**: for each relationship kind, articles contribute
+`(score × |weight| × recency_weight)` to the numerator and
+`|weight| × recency_weight` to the denominator. Negative weights
+(COMPETITOR) preserve sign on contribution but not on the magnitude
+denominator. The result is a signed weighted mean bounded roughly in
+[−1, +1].
+
+**Persistence**: `Prediction.model_version = f"{base_model}+aff:default"`
+so blended and unblended calls coexist as two separate rows under the
+existing `(target_symbol, prediction_date, model_version)` uniqueness
+constraint.
+
+**THEME_MEMBER co-membership**: `_theme_co_members(symbol)` does the
+inverse lookup (themes containing the target → all other constituents)
+and excludes the target itself so its own articles aren't
+double-counted via the theme path.
+
+Tests: +23 (new `tests/test_affinity_blend.py`), **100% line+branch
+coverage on `blended.py`**. Net: 698 → 721 passing.
+
+**Test-helper bug surfaced** (documented inline): the `_seed` factory
+in the new test file re-scored already-scored articles when called
+multiple times for the same symbol — UNIQUE constraint on
+`sentiment_scores.(article_id, model_version)`. Fixed by looking up
+only the just-inserted finnhub_ids rather than a tail-slice of all
+articles for that symbol. Plus one test used the same
+`finnhub_id_start` across loop iterations — also fixed by including
+the loop index in the start offset.
+
+---
+
+## PR-8 — AFFINITY_WEIGHT learning dimension (persistence + read hooks)
+
+*3 files, +298 / −7*
+
+**Hooks shipped; `gp_minimize` integration deferred** to a follow-up
+since a blended objective requires substantial refactoring of
+`learning/simulate.py`. What landed:
+
+**New dimension** `DIM_AFFINITY_WEIGHT = "AFFINITY_WEIGHT"` registered
+in `learning.config.DIMENSIONS`. One `LearnedWeight` row per
+relationship (key = relationship string, value = float).
+
+**`LearnedConfig` extended** in `learning/config.py`:
+
+* New field `affinity_weights: dict[str, float]`.
+* New method `to_affinity_weights() -> AffinityWeights` — lazily
+  imports `AffinityWeights` to avoid an import cycle; missing keys
+  fall back to the curated default per-field rather than zeroing out.
+* `_config_from_rows` extended to load `DIM_AFFINITY_WEIGHT` rows keyed
+  by relationship.
+
+**`_persist_weights` extended** in `learning/train.py`:
+
+* New helper `_curated_affinity_baseline()` returns the curated
+  defaults as a `dict[relationship, weight]`.
+* New optional `affinity_weights=` argument; when None, persists the
+  curated baseline (so every fresh training run carries the curated
+  values as v1). When supplied, persists only those values.
+
+**Read path**: `weights_for_version` and `active_weights` already
+walk `_config_from_rows` so they automatically round-trip the new
+dimension. The blended predictor can call
+`active_weights(session).to_affinity_weights()` to materialise an
+`AffinityWeights` for use at call time.
+
+Tests: +13 (new `tests/test_affinity_learning.py`). Net: 721 → 734
+passing.
+
+**Out of scope** (filed as PR-8-follow-up): wiring `gp_minimize` over
+the new dimensions inside a blended objective in
+`learning/simulate.py`. The persistence + read machinery shipped here
+is the foundation; the optimiser loop becomes a small extension once
+the blended objective is in place.
+
+---
+
+## 2026-05-21 — docs sweep: bring progress.md / summary.md / diff.md current
+
+*3 files updated, no code changed.*
+
+* `progress.md` gains a `## Session log` section with one dated entry
+  per turn of the collaborative session — discovery, decisions locked,
+  then one entry per PR landed.
+* `summary.md` test count bumped to 734; full PR-1 → PR-8 changelog
+  blocks added; pointers to the three new reference docs
+  (`architecture.md`, `security.md`, `design.md`).
+* `diff.md` (this file) gains a kickoff entry + eight PR entries
+  (PR-1 → PR-8) + this docs-sweep entry; branch totals at the top
+  updated.
+
+Coverage at the close of the session: **96% line+branch maintained**
+across the package, **734 tests passing in 65.2s**.
+
+---
+
 ## Files added (by directory)
 
 ```
@@ -996,13 +1458,17 @@ finn_predictor/
   config.py · cli.py · logging_config.py · security.py
   ingestion/
     __init__.py · backfill.py · client.py · jobs.py · news.py ·
-    prices.py · prices_yf.py
+    prices.py · prices_yf.py ·
+    symbols.py            (NEW — PR-1)
   learning/
     __init__.py · config.py · simulate.py · train.py
   predictor/
     __init__.py · aggregate.py · backtest.py · classifier.py ·
     explain.py · focus.py · magnitude.py · market.py · sectors.py ·
-    stocks.py · trades.py
+    stocks.py · trades.py ·
+    affinity.py           (NEW — PR-4 + extended in PR-5, PR-6)
+    themes.py             (NEW — PR-6)
+    blended.py            (NEW — PR-7)
   sentiment/
     __init__.py · base.py · finbert.py · vader.py
   storage/
@@ -1024,12 +1490,24 @@ tests/
   test_prices_yf.py · test_sector_membership.py · test_security.py ·
   test_sentiment.py · test_storage_repo.py · test_stories.py ·
   test_symbol_names.py · test_trades.py · test_ui_helpers.py ·
-  test_ui_smoke.py
+  test_ui_smoke.py ·
+  test_symbols.py                  (NEW — PR-1)
+  test_watchlists.py               (NEW — PR-2)
+  test_ui_watchlist_helpers.py     (NEW — PR-2)
+  test_streaks.py                  (NEW — PR-3)
+  test_affinity_competitors.py     (NEW — PR-4)
+  test_affinity_institutional.py   (NEW — PR-5)
+  test_themes.py                   (NEW — PR-6)
+  test_affinity_blend.py           (NEW — PR-7)
+  test_affinity_learning.py        (NEW — PR-8)
 
 progress.md · summary.md · diff.md · user-manual.md ·
 installation-manual.md · deployment-manual.md · pytest.ini ·
 .coveragerc · requirements.txt · Dockerfile · docker-compose.yml ·
-docker/entrypoint.sh · .dockerignore
+docker/entrypoint.sh · .dockerignore ·
+architecture.md       (NEW — 2026-05-21 kickoff)
+security.md           (NEW — 2026-05-21 kickoff)
+design.md             (NEW — 2026-05-21 kickoff)
 ```
 
 ## Files in the upstream library that were NOT touched

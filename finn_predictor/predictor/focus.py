@@ -72,8 +72,14 @@ class CompanyFocus:
     own_prediction: Optional[Prediction]
     sector_prediction: Optional[Prediction]
     peers: list[RelatedPrediction] = field(default_factory=list)
+    competitors: list[RelatedPrediction] = field(default_factory=list)
     suppliers: list[RelatedPrediction] = field(default_factory=list)
     customers: list[RelatedPrediction] = field(default_factory=list)
+    # PR-5: 13-F filers holding the target. ``related_symbol`` is the
+    # institution name (not a ticker), so the attached Prediction lookup
+    # is generally None — institutions aren't directly tradable. Kept
+    # here so the Focus tab can render the holder list alongside.
+    institutional_holders: list[RelatedPrediction] = field(default_factory=list)
     recent_articles: list[dict] = field(default_factory=list)
 
 
@@ -224,20 +230,31 @@ def compose_company_focus(
     peers = _attach_predictions(
         session, related_entities_for(session, symbol, relationship="PEER")
     )
+    competitors = _attach_predictions(
+        session, related_entities_for(session, symbol, relationship="COMPETITOR")
+    )
     suppliers = _attach_predictions(
         session, related_entities_for(session, symbol, relationship="SUPPLIER")
     )
     customers = _attach_predictions(
         session, related_entities_for(session, symbol, relationship="CUSTOMER")
     )
+    institutional_holders = _attach_predictions(
+        session,
+        related_entities_for(
+            session, symbol, relationship="INSTITUTIONAL_HOLDER"
+        ),
+    )
 
     sector_code, sector_name, etf_symbol = _sector_for_symbol(session, symbol)
     sector_pred = _latest_prediction(session, etf_symbol) if etf_symbol else None
 
     # Universe of tickers we want articles for: the subject + its peers +
-    # supply-chain neighbours. We keep the article window short and bounded.
+    # competitors + supply-chain neighbours. We keep the article window
+    # short and bounded.
     universe = {symbol}
     universe.update(p.related_symbol for p in peers)
+    universe.update(p.related_symbol for p in competitors)
     universe.update(p.related_symbol for p in suppliers)
     universe.update(p.related_symbol for p in customers)
     recent = _recent_articles_for_symbols(
@@ -253,8 +270,10 @@ def compose_company_focus(
         own_prediction=own,
         sector_prediction=sector_pred,
         peers=peers,
+        competitors=competitors,
         suppliers=suppliers,
         customers=customers,
+        institutional_holders=institutional_holders,
         recent_articles=recent,
     )
 

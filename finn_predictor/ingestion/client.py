@@ -203,3 +203,28 @@ class FinnhubGateway:
     def etfs_holdings(self, symbol: str) -> dict[str, Any]:
         """Top holdings of an ETF (used for sector ETFs)."""
         return self._call(self.client.etfs_holdings, symbol=symbol)
+
+    def stock_investment_theme(self, theme: str) -> dict[str, Any]:
+        """Constituents of a Finnhub investment theme.
+
+        The upstream returns ``{"theme": ..., "symbols": [...]}`` on
+        success. Gated on most paid plans; same resilient-ingest
+        treatment as the other endpoints (scrubbed IngestionError).
+        """
+        return self._call(self.client.stock_investment_theme, theme)
+
+    def institutional_ownership(
+        self, symbol: str, _from: str, to: str
+    ) -> dict[str, Any]:
+        """13-F institutional holders for ``symbol`` in ``[_from, to]``.
+
+        Date params are ISO ``YYYY-MM-DD`` strings (matches the upstream
+        client). ``cusip`` is passed as an empty string — Finnhub's
+        ``/institutional/ownership`` accepts symbol-only lookups and
+        treats cusip as optional. Gated on most paid plans; the
+        affinity refresh path collects ``IngestionError`` per call so
+        a 403 here doesn't abort the rest of the sweep.
+        """
+        return self._call(
+            self.client.institutional_ownership, symbol, "", _from, to
+        )

@@ -23,6 +23,8 @@ import sys
 from dataclasses import asdict
 from typing import Sequence
 
+from sqlalchemy import select
+
 from finn_predictor.config import DEFAULT_DB_URL, load_settings
 from finn_predictor.storage import create_engine_and_session, init_db
 from finn_predictor.storage.models import Base
@@ -139,6 +141,85 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh.add_argument(
         "--limit", type=int, default=25,
         help="Maximum constituents to cache per sector (default 25).",
+    )
+
+    # PR-4: affinity / competitor curation subcommands.
+    promote = sub.add_parser(
+        "promote-competitor",
+        help=(
+            "Mark a (symbol, peer_symbol) pair as COMPETITOR in the "
+            "relationship cache. Operator-curated; bypasses the "
+            "industry-match check used by refresh-competitors."
+        ),
+    )
+    promote.add_argument("symbol", help="The target ticker (e.g. AAPL).")
+    promote.add_argument("peer_symbol", help="The competitor's ticker (e.g. MSFT).")
+
+    demote = sub.add_parser(
+        "demote-competitor",
+        help=(
+            "Remove a COMPETITOR row from the relationship cache. "
+            "The matching PEER row (if any) is preserved."
+        ),
+    )
+    demote.add_argument("symbol", help="The target ticker (e.g. AAPL).")
+    demote.add_argument("peer_symbol", help="The peer ticker to demote.")
+
+    refresh_comp = sub.add_parser(
+        "refresh-competitors",
+        help=(
+            "Auto-seed COMPETITOR rows for one or more tickers by "
+            "matching their PEER rows on Finnhub finnhubIndustry. "
+            "Requires FINNHUB_API_KEY. Per-ticker failure isolation."
+        ),
+    )
+    refresh_comp.add_argument(
+        "--symbol",
+        action="append",
+        required=True,
+        help=(
+            "Ticker to seed competitors for (repeatable). At least "
+            "one is required."
+        ),
+    )
+
+    # PR-6: investment themes.
+    add_theme = sub.add_parser(
+        "add-theme",
+        help=(
+            "Register an InvestmentTheme without an immediate Finnhub "
+            "fetch. Use refresh-themes afterward to populate "
+            "constituents."
+        ),
+    )
+    add_theme.add_argument("theme_code", help="Finnhub theme code (e.g. cyberSecurity).")
+    add_theme.add_argument(
+        "--name", default=None,
+        help="Display name (default: title-case render of theme_code).",
+    )
+    add_theme.add_argument(
+        "--description", default=None,
+        help="Optional human-readable description.",
+    )
+
+    refresh_themes = sub.add_parser(
+        "refresh-themes",
+        help=(
+            "Pull constituents for every registered InvestmentTheme "
+            "via Finnhub /stock/investment-theme. Requires "
+            "FINNHUB_API_KEY. Falls back to the curated default theme "
+            "list when no themes are registered."
+        ),
+    )
+    refresh_themes.add_argument(
+        "--theme",
+        action="append",
+        default=None,
+        help=(
+            "Restrict to specific theme codes (repeatable). Default "
+            "refreshes every theme already in the DB; if none, uses "
+            "the curated DEFAULT_THEME_CODES list."
+        ),
     )
 
     return p
@@ -488,6 +569,198 @@ def cmd_refresh_constituents(
     return 0
 
 
+def cmd_promote_competitor(*, symbol: str, peer_symbol: str) -> int:
+    """Manually mark ``peer_symbol`` as a COMPETITOR of ``symbol``.
+
+    No API call — pure DB mutation. Exits 2 on validation failure.
+    """
+    from finn_predictor.predictor.affinity import promote_peer_to_competitor
+
+    url = _resolve_db_url()
+    engine, SessionLocal = create_engine_and_session(url)
+    init_db(engine)
+    try:
+        with SessionLocal() as session:
+            row = promote_peer_to_competitor(
+                session, symbol=symbol, peer_symbol=peer_symbol
+            )
+    except ValueError as exc:
+        print(f"promote-competitor: {exc}", file=sys.stderr)
+        return 2
+    print(
+        json.dumps(
+            {
+                "action": "promoted",
+                "source_symbol": row.source_symbol,
+                "related_symbol": row.related_symbol,
+                "relationship": row.relationship,
+            }
+        )
+    )
+    return 0
+
+
+def cmd_demote_competitor(*, symbol: str, peer_symbol: str) -> int:
+    """Remove a COMPETITOR row. Exit 0 whether the row existed or not."""
+    from finn_predictor.predictor.affinity import demote_competitor
+
+    url = _resolve_db_url()
+    engine, SessionLocal = create_engine_and_session(url)
+    init_db(engine)
+    try:
+        with SessionLocal() as session:
+            removed = demote_competitor(
+                session, symbol=symbol, peer_symbol=peer_symbol
+            )
+    except ValueError as exc:
+        print(f"demote-competitor: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps({"action": "demoted", "removed": removed}))
+    return 0
+
+
+def cmd_refresh_competitors(*, symbols: list[str]) -> int:
+    """Auto-seed COMPETITOR rows for one or more tickers.
+
+    Requires FINNHUB_API_KEY. Iterates ``symbols``, calling
+    :func:`refresh_competitors` for each. Per-ticker failure isolation
+    — a missing industry or network blip on one symbol doesn't block
+    the rest. Prints a JSON summary; exits 2 only when the API key
+    is missing.
+    """
+    from finn_predictor.config import load_settings
+    from finn_predictor.ingestion.client import FinnhubGateway, RateLimiter
+    from finn_predictor.predictor.affinity import refresh_competitors
+    from finnhub import Client as FinnhubClient
+
+    try:
+        settings = load_settings()  # requires FINNHUB_API_KEY
+    except RuntimeError as exc:
+        print(f"refresh-competitors: {exc}", file=sys.stderr)
+        return 2
+
+    url = _resolve_db_url()
+    engine, SessionLocal = create_engine_and_session(url)
+    init_db(engine)
+
+    client = FinnhubClient(api_key=settings.finnhub_api_key)
+    try:
+        client._session.trust_env = False
+    except AttributeError:  # pragma: no cover
+        pass
+
+    summary: dict[str, object] = {"refreshed": [], "failures": []}
+
+    try:
+        gateway = FinnhubGateway(
+            client=client,
+            rate_limiter=RateLimiter(settings.rate_limit_per_minute),
+        )
+        with SessionLocal() as session:
+            for sym in symbols:
+                result = refresh_competitors(session, gateway, symbol=sym)
+                summary["refreshed"].append(
+                    {
+                        "symbol": result.symbol,
+                        "competitors_added": result.competitors_added,
+                        "peers_considered": result.peers_considered,
+                        "skipped_no_industry": result.skipped_no_industry,
+                    }
+                )
+                for f in result.failures:
+                    summary["failures"].append({"symbol": result.symbol, **f})
+    finally:
+        client.close()
+
+    print(json.dumps(summary, indent=2, default=str))
+    return 0
+
+
+def cmd_add_theme(
+    *, theme_code: str, name: str | None, description: str | None
+) -> int:
+    """Register an InvestmentTheme row. No API call. Exit 2 on validation."""
+    from finn_predictor.predictor.affinity import add_investment_theme
+
+    url = _resolve_db_url()
+    engine, SessionLocal = create_engine_and_session(url)
+    init_db(engine)
+    try:
+        with SessionLocal() as session:
+            row = add_investment_theme(
+                session,
+                theme_code=theme_code,
+                name=name,
+                description=description,
+            )
+    except ValueError as exc:
+        print(f"add-theme: {exc}", file=sys.stderr)
+        return 2
+    print(
+        json.dumps({
+            "action": "registered",
+            "theme_code": row.theme_code,
+            "name": row.name,
+            "description": row.description,
+        })
+    )
+    return 0
+
+
+def cmd_refresh_themes(*, theme_codes: list[str] | None) -> int:
+    """Pull THEME_MEMBER constituents for registered (or curated) themes."""
+    from finn_predictor.config import load_settings
+    from finn_predictor.ingestion.client import FinnhubGateway, RateLimiter
+    from finn_predictor.predictor.affinity import refresh_investment_themes
+    from finn_predictor.predictor.themes import DEFAULT_THEME_CODES
+    from finn_predictor.storage.models import InvestmentTheme
+    from finnhub import Client as FinnhubClient
+
+    try:
+        settings = load_settings()
+    except RuntimeError as exc:
+        print(f"refresh-themes: {exc}", file=sys.stderr)
+        return 2
+
+    url = _resolve_db_url()
+    engine, SessionLocal = create_engine_and_session(url)
+    init_db(engine)
+
+    client = FinnhubClient(api_key=settings.finnhub_api_key)
+    try:
+        client._session.trust_env = False
+    except AttributeError:  # pragma: no cover
+        pass
+
+    try:
+        gateway = FinnhubGateway(
+            client=client,
+            rate_limiter=RateLimiter(settings.rate_limit_per_minute),
+        )
+        with SessionLocal() as session:
+            if theme_codes:
+                codes = list(theme_codes)
+            else:
+                registered = list(session.scalars(select(InvestmentTheme)))
+                codes = (
+                    [t.theme_code for t in registered]
+                    if registered else list(DEFAULT_THEME_CODES)
+                )
+            result = refresh_investment_themes(
+                session, gateway, theme_codes=codes
+            )
+    finally:
+        client.close()
+
+    print(json.dumps({
+        "themes_processed": result.themes_processed,
+        "themes_added": result.themes_added,
+        "members_added": result.members_added,
+        "failures": result.failures,
+    }, indent=2, default=str))
+    return 0
+
+
 def cmd_serve() -> int:
     """Print the Streamlit launch command; never starts it itself.
 
@@ -530,6 +803,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_fit_magnitude(target_symbol=args.target_symbol)
     if cmd == "refresh-constituents":
         return cmd_refresh_constituents(etfs=args.etf, limit=int(args.limit))
+    if cmd == "promote-competitor":
+        return cmd_promote_competitor(
+            symbol=args.symbol, peer_symbol=args.peer_symbol
+        )
+    if cmd == "demote-competitor":
+        return cmd_demote_competitor(
+            symbol=args.symbol, peer_symbol=args.peer_symbol
+        )
+    if cmd == "refresh-competitors":
+        return cmd_refresh_competitors(symbols=args.symbol)
+    if cmd == "add-theme":
+        return cmd_add_theme(
+            theme_code=args.theme_code,
+            name=args.name,
+            description=args.description,
+        )
+    if cmd == "refresh-themes":
+        return cmd_refresh_themes(theme_codes=args.theme)
     parser.print_help(sys.stderr)
     return 2
 

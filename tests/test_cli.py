@@ -462,3 +462,120 @@ def test_unknown_subcommand_returns_2(capsys, tmp_path, monkeypatch) -> None:
         # argparse exits with SystemExit on unknown subcommands.
         main(["nope"])
     assert info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# PR-4: promote-competitor / demote-competitor / refresh-competitors
+# ---------------------------------------------------------------------------
+
+def test_promote_competitor_writes_row(tmp_path, monkeypatch, capsys) -> None:
+    db_url = f"sqlite:///{tmp_path}/f.db"
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", db_url)
+    rc = main(["promote-competitor", "AAPL", "MSFT"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["action"] == "promoted"
+    assert parsed["source_symbol"] == "AAPL"
+    assert parsed["related_symbol"] == "MSFT"
+    assert parsed["relationship"] == "COMPETITOR"
+
+
+def test_promote_competitor_rejects_invalid_symbol(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv(
+        "FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db"
+    )
+    rc = main(["promote-competitor", "AAPL", "INVALID;CHAR"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "not a valid ticker" in err
+
+
+def test_demote_competitor_after_promote(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv(
+        "FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db"
+    )
+    main(["promote-competitor", "AAPL", "MSFT"])
+    capsys.readouterr()  # drain
+    rc = main(["demote-competitor", "AAPL", "MSFT"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["removed"] is True
+
+
+def test_demote_competitor_missing_returns_false_not_error(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Idempotent demote: no row → exit 0 with removed=false."""
+    monkeypatch.setenv(
+        "FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db"
+    )
+    rc = main(["demote-competitor", "AAPL", "MSFT"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["removed"] is False
+
+
+def test_refresh_competitors_requires_api_key(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    monkeypatch.setenv(
+        "FINN_PREDICTOR_DB_URL", f"sqlite:///{tmp_path}/f.db"
+    )
+    rc = main(["refresh-competitors", "--symbol", "AAPL"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "FINNHUB_API_KEY" in err
+
+
+def test_refresh_competitors_happy_path(tmp_path, monkeypatch, capsys) -> None:
+    """Seed PEER rows + mock company_profile2 + run the CLI; expect a
+    COMPETITOR row for the same-industry peer."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from finn_predictor.storage import init_db
+    from finn_predictor.storage.repo import upsert_related_entity
+
+    db_url = f"sqlite:///{tmp_path}/f.db"
+    monkeypatch.setenv("FINNHUB_API_KEY", "stub")
+    monkeypatch.setenv("FINN_PREDICTOR_DB_URL", db_url)
+
+    # Pre-seed a PEER row so refresh has something to walk.
+    engine = create_engine(db_url, future=True)
+    init_db(engine)
+    with Session(engine) as s:
+        upsert_related_entity(
+            s, source_symbol="AAPL", related_symbol="MSFT",
+            relationship="PEER", rank=0,
+        )
+
+    with patch(
+        "finn_predictor.ingestion.client.FinnhubGateway.company_profile2",
+        side_effect=lambda symbol: {
+            "AAPL": {"finnhubIndustry": "Technology"},
+            "MSFT": {"finnhubIndustry": "Technology"},
+        }[symbol],
+    ):
+        rc = main(["refresh-competitors", "--symbol", "AAPL"])
+
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["refreshed"][0]["competitors_added"] == 1
+
+
+def test_parser_recognises_new_competitor_commands() -> None:
+    parser = _build_parser()
+    args = parser.parse_args(["promote-competitor", "AAPL", "MSFT"])
+    assert args.command == "promote-competitor"
+    assert args.symbol == "AAPL"
+    assert args.peer_symbol == "MSFT"
+
+    args = parser.parse_args(["demote-competitor", "AAPL", "MSFT"])
+    assert args.command == "demote-competitor"
+
+    args = parser.parse_args(["refresh-competitors", "--symbol", "AAPL"])
+    assert args.command == "refresh-competitors"
+    assert args.symbol == ["AAPL"]

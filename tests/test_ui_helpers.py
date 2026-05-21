@@ -312,8 +312,142 @@ def test_stock_predictions_table_columns_and_sort(session) -> None:
 def test_stock_predictions_table_empty_returns_typed_frame(session) -> None:
     df = stock_predictions_table(session, [])
     assert df.empty
-    for col in ("Company", "Ticker", "Call", "Confidence", "Articles", "Sentiment"):
+    for col in (
+        "Company", "Ticker", "Call", "Confidence",
+        "Streak", "Flipped", "Articles", "Sentiment", "Band", "As of",
+    ):
         assert col in df.columns
+
+
+# ---------------- PR-3: Streak / Flipped / Band columns + CSV ----------------
+
+def test_stock_predictions_table_includes_streak_flipped_band(session) -> None:
+    """Per-stock table is augmented with Streak, Flipped, and Band columns."""
+    from finn_predictor.storage.repo import StreakInfo
+    from finn_predictor.ui.app import predictions_csv_bytes
+
+    p = make_prediction(
+        target_symbol="AAPL",
+        prediction_date=D,
+        label="UP",
+        confidence=0.7,
+        sentiment_index=0.4,
+        article_count=10,
+    )
+    # Magnitude band — set the three optional columns so format_expected_move
+    # has something to render in the Band column.
+    p.expected_return_p10 = -0.012
+    p.expected_return_p50 = 0.004
+    p.expected_return_p90 = 0.025
+
+    injected = {
+        "AAPL": StreakInfo(
+            symbol="AAPL",
+            current_label="UP",
+            streak=3,
+            previous_label="DOWN",
+            flipped=True,
+        )
+    }
+    df = stock_predictions_table(session, [p], streaks=injected)
+    assert list(df["Streak"]) == [3]
+    # pandas wraps Python bool as numpy.bool_, which is not ``is True``;
+    # use a truthiness check instead of identity.
+    assert bool(df.iloc[0]["Flipped"]) is True
+    band = df.iloc[0]["Band"]
+    assert "-1.20%" in band and "+2.50%" in band
+    # CSV export round-trips the new columns.
+    csv = predictions_csv_bytes(df)
+    assert b"Streak" in csv and b"Flipped" in csv and b"Band" in csv
+    assert b"AAPL" in csv
+
+
+def test_stock_predictions_table_defaults_when_no_streak_info(session) -> None:
+    """Without a streaks dict entry, Streak defaults to 1 and Flipped to False
+    so the per-row render never crashes on a brand-new ticker."""
+    p = make_prediction(
+        target_symbol="NVDA",
+        prediction_date=D,
+        label="DOWN",
+        confidence=0.3,
+        sentiment_index=-0.2,
+        article_count=4,
+    )
+    df = stock_predictions_table(session, [p], streaks={})
+    assert df.iloc[0]["Streak"] == 1
+    # numpy.bool_ vs Python bool — truthiness check is safe across both.
+    assert bool(df.iloc[0]["Flipped"]) is False
+    # Band column exists but is the empty string (no calibration).
+    assert df.iloc[0]["Band"] == ""
+
+
+def test_stock_predictions_table_auto_computes_streaks(session) -> None:
+    """When ``streaks=None`` the builder queries the DB itself.
+
+    Persist two predictions for AAPL (UP, then UP again) and verify
+    the rendered Streak is 2 without injecting streak info.
+    """
+    from datetime import timedelta
+    from finn_predictor.storage.repo import save_prediction
+
+    p1 = make_prediction(
+        target_symbol="AAPL",
+        prediction_date=D - timedelta(days=1),
+        label="UP",
+        confidence=0.5,
+        sentiment_index=0.1,
+        article_count=2,
+    )
+    p2 = make_prediction(
+        target_symbol="AAPL",
+        prediction_date=D,
+        label="UP",
+        confidence=0.7,
+        sentiment_index=0.2,
+        article_count=3,
+    )
+    save_prediction(session, p1)
+    save_prediction(session, p2)
+
+    df = stock_predictions_table(session, [p2])
+    assert df.iloc[0]["Streak"] == 2
+    assert bool(df.iloc[0]["Flipped"]) is False
+
+
+def test_predictions_csv_bytes_empty_frame_emits_header_only(session) -> None:
+    """Empty frame → CSV that still contains the column header. UTF-8 bytes."""
+    from finn_predictor.ui.app import predictions_csv_bytes
+    df = stock_predictions_table(session, [])
+    out = predictions_csv_bytes(df)
+    assert isinstance(out, bytes)
+    decoded = out.decode("utf-8")
+    # Header row only (one terminator).
+    lines = [ln for ln in decoded.splitlines() if ln.strip()]
+    assert len(lines) == 1
+    # Every expected column is present.
+    for col in ("Company", "Ticker", "Call", "Streak", "Flipped", "Band"):
+        assert col in lines[0]
+
+
+def test_predictions_csv_bytes_roundtrips_via_pandas(session) -> None:
+    """Sanity: the emitted bytes parse back into an equivalent DataFrame."""
+    import io
+    import pandas as pd
+    from finn_predictor.ui.app import predictions_csv_bytes
+
+    p = make_prediction(
+        target_symbol="AAPL",
+        prediction_date=D,
+        label="UP",
+        confidence=0.42,
+        sentiment_index=0.31,
+        article_count=8,
+    )
+    df = stock_predictions_table(session, [p])
+    raw = predictions_csv_bytes(df)
+    parsed = pd.read_csv(io.BytesIO(raw))
+    assert list(parsed["Ticker"]) == ["AAPL"]
+    assert list(parsed["Call"]) == ["UP"]
 
 
 # ---------------- price backfill + Performance charts ----------------
