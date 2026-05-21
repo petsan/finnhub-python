@@ -1,5 +1,28 @@
 # finnhub-python
 
+> **Branch note.** The `finn-predictor` branch on this fork carries
+> **Finn-Predictor** — a sentiment-driven market & per-stock direction
+> predictor built on top of this upstream client. The upstream library
+> below is unchanged; everything new lives under `finn_predictor/`,
+> `tests/`, and a handful of top-level config + doc files. Jump to
+> the docs:
+>
+> * **`summary.md`** — 1-page architecture overview of Finn-Predictor.
+> * **`user-manual.md`** — how to drive the dashboard.
+> * **`installation-manual.md`** — env-var reference, Docker
+>   quickstart, Postgres switch.
+> * **`deployment-manual.md`** — Proxmox LXC, Docker, and bare-metal
+>   deployment paths, reverse-proxy + TLS, monitoring, hardening.
+> * **`deploy/proxmox/install.sh`** — one-shot Proxmox LXC installer.
+> * **`progress.md`** — design decisions and full status.
+> * **`diff.md`** — per-commit change log on this branch.
+>
+> The remainder of this README documents the upstream `finnhub-python`
+> client itself — you'll want this if you're embedding the client
+> directly rather than running the Finn-Predictor app on top.
+
+---
+
 - API documentation: https://finnhub.io/docs/api
 - API version: 1.0.0
 - Package version: 2.4.25

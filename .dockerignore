@@ -1,0 +1,44 @@
+# Keep the build context tight — avoid pushing the venv, caches, and
+# local SQLite files into the image.
+
+.git
+.gitignore
+.gitlab-ci.yml
+.travis.yml
+
+# Local Python tooling
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+*.egg
+build
+dist
+
+# Test / coverage
+.pytest_cache
+.coverage
+htmlcov
+coverage.xml
+
+# Local SQLite DBs and logs (the DB is generated inside the container's
+# volume; never bake the host copy in).
+*.sqlite
+*.sqlite3
+*.db
+finn_predictor.db
+/tmp
+
+# IDE
+.idea
+.vscode
+
+# Docs that aren't needed at runtime
+diff.md
+summary.md
+progress.md
+CHANGELOG.md
+release.sh
+git_push.sh
+examples.py

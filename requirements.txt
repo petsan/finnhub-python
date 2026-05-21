@@ -1,2 +1,44 @@
-requests >= 2.22.0
-future; python_version<="2.7"
+# Finn-Predictor application dependencies.
+#
+# Distinct from the upstream finnhub-python library's requirements
+# (which lives in this file in pure-library projects). The Docker image
+# installs this file plus `pip install -e .` so the local finnhub
+# client + finn_predictor package are both importable.
+
+# --- Upstream library runtime dep (mirrors setup.py REQUIRES) ---
+requests>=2.22.0
+
+# --- Web UI ---
+streamlit>=1.32
+altair>=5
+
+# --- Storage ---
+SQLAlchemy>=2.0
+
+# --- Scheduling (in-process daily ingest job) ---
+APScheduler>=3.10
+
+# --- Sentiment scoring (iter 1) ---
+vaderSentiment>=3.3.2
+
+# --- Tabular data (used by UI + predictor.trades) ---
+pandas>=2.0
+
+# --- Price ingestion (yfinance fills the gap left by Finnhub's gated
+#     /stock/candle endpoint) ---
+yfinance>=0.2
+
+# --- Self-improvement (Bayesian optimisation of learned weights) ---
+scikit-optimize>=0.10
+
+# --- Auth gate (FINN_PREDICTOR_PASSWORD_HASH) ---
+bcrypt>=4.0
+
+# --- Browser-localStorage bridge for the sidebar API-key field.
+#     Self-contained Streamlit component with a bundled frontend; no
+#     transitive heavyweight deps. Pinned loose because the package
+#     is still 0.x. ---
+streamlit-local-storage>=0.0.20
+
+# --- Optional: Postgres driver. Comment out if you only use SQLite. ---
+psycopg[binary]>=3.1
